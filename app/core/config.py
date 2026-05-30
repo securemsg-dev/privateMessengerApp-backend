@@ -9,7 +9,7 @@ All settings are read once at startup from .env (or real env vars in production)
 from functools import lru_cache
 from typing import Any, Union, Optional, Literal
 
-from pydantic import AnyUrl, computed_field
+from pydantic import AnyUrl, computed_field, field_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
@@ -36,6 +36,16 @@ class Settings(BaseSettings):
 
     # ── Database ─────────────────────────────────────────────────────────
     DATABASE_URL: str = "postgresql+asyncpg://postgres:postgres@localhost:5432/private_messenger"
+
+    @field_validator("DATABASE_URL", mode="before")
+    @classmethod
+    def _normalize_db_scheme(cls, v: str) -> str:
+        # Railway (and Heroku) supply postgresql:// or postgres://, but
+        # create_async_engine requires the postgresql+asyncpg:// dialect.
+        for prefix in ("postgresql://", "postgres://"):
+            if v.startswith(prefix):
+                return "postgresql+asyncpg://" + v[len(prefix):]
+        return v
 
     # ── Redis ────────────────────────────────────────────────────────────
     REDIS_URL: str = "redis://localhost:6379/0"
