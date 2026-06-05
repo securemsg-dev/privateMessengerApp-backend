@@ -14,6 +14,7 @@ from fastapi import APIRouter, Request, status
 from app.core.dependencies import CurrentUser, DBSession
 from app.core.limiter import limiter
 from app.schemas.messaging import (
+    ProfileUpdateRequest,
     PublicKeyUploadRequest,
     UserPublic,
 )
@@ -32,6 +33,32 @@ async def get_me(
     request: Request,
     current_user: CurrentUser,
 ) -> UserPublic:
+    return UserPublic.model_validate(current_user)
+
+
+@router.patch(
+    "/me",
+    response_model=UserPublic,
+    status_code=status.HTTP_200_OK,
+    summary="Update the current user's display name or profile picture",
+)
+@limiter.limit("20/minute")
+async def update_me(
+    request: Request,
+    body: ProfileUpdateRequest,
+    current_user: CurrentUser,
+    db: DBSession,
+) -> UserPublic:
+    """
+    Partial update — only fields explicitly set (non-null) are applied.
+    Pass `profile_picture_key` with the blob_id returned by POST /media/upload-url
+    after the image bytes have been PUT successfully.
+    """
+    if body.display_name is not None:
+        current_user.display_name = body.display_name
+    if body.profile_picture_key is not None:
+        current_user.profile_picture_key = body.profile_picture_key
+    await db.flush()
     return UserPublic.model_validate(current_user)
 
 

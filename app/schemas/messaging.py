@@ -31,8 +31,15 @@ class UserPublic(BaseModel):
     private_number: str
     display_name: Optional[str]
     public_key: Optional[str]
+    profile_picture_key: Optional[str] = None
 
     model_config = {"from_attributes": True}
+
+
+class ProfileUpdateRequest(BaseModel):
+    """Partial update body for PATCH /users/me. None = leave field unchanged."""
+    display_name: Optional[str] = Field(None, max_length=100)
+    profile_picture_key: Optional[str] = Field(None, max_length=512)
 
 
 # ── Contact lookup ─────────────────────────────────────────────────────────────
