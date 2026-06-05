@@ -99,7 +99,7 @@ class ConversationCreateRequest(BaseModel):
 class LastMessagePreview(BaseModel):
     id: UUID
     sender_id: UUID
-    message_type: Literal["text", "voice", "image"]
+    message_type: Literal["text", "voice", "image", "document"]
     encrypted_payload: str
     created_at: datetime
     self_destruct: bool
@@ -170,7 +170,7 @@ class MessageReplyPreview(BaseModel):
     """
     id: UUID
     sender_id: UUID
-    message_type: Literal["text", "voice", "image"]
+    message_type: Literal["text", "voice", "image", "document"]
     encrypted_payload: str
 
     model_config = {"from_attributes": True}
@@ -193,7 +193,7 @@ class MessageResponse(BaseModel):
     id: UUID
     conversation_id: UUID
     sender_id: UUID
-    message_type: Literal["text", "voice", "image"]
+    message_type: Literal["text", "voice", "image", "document"]
     encrypted_payload: str
     created_at: datetime
     delivered_at: Optional[datetime]

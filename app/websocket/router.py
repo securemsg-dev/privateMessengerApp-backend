@@ -37,6 +37,7 @@ Outbound (server → client) events follow the same shape but always include
 `conversation_id` so clients can multiplex if they ever subscribe to multiple.
 """
 
+import asyncio
 import json
 import logging
 from datetime import datetime, timezone
@@ -51,7 +52,9 @@ from app.core.security import verify_access_token
 from app.db.models.conversation import conversation_participants
 from app.db.models.message import MessageMetadata, MessageType
 from app.db.models.message_reaction import MessageReaction
+from app.db.models.user import User
 from app.db.session import AsyncSessionLocal
+from app.services.push_service import send_push_to_users
 from app.websocket.manager import manager
 
 import redis.asyncio as aioredis
@@ -162,6 +165,57 @@ async def _handle_message(
         "timestamp": msg.created_at.isoformat(),
     }
     await manager.publish(redis, conv_id_str, event)
+
+    # Fire push notification to participants who are not currently connected
+    # to this conversation's WebSocket. Run as a background task so it doesn't
+    # add latency to the message delivery path.
+    asyncio.ensure_future(
+        _push_new_message(conversation_id, conv_id_str, user_id, msg.id)
+    )
+
+
+async def _push_new_message(
+    conversation_id: UUID,
+    conv_id_str: str,
+    sender_id: UUID,
+    message_id: UUID,
+) -> None:
+    """Send push notifications to offline participants after a new message."""
+    try:
+        async with AsyncSessionLocal() as db:
+            # Participants of this conversation excluding the sender
+            rows = await db.execute(
+                select(conversation_participants.c.user_id).where(
+                    conversation_participants.c.conversation_id == conversation_id,
+                    conversation_participants.c.user_id != sender_id,
+                )
+            )
+            all_other_ids: list[UUID] = [r.user_id for r in rows]
+
+            # Only push to users who are NOT connected to this conversation WS
+            connected_ids = set(manager._conv_connections.get(conv_id_str, {}).keys())
+            offline_ids = [uid for uid in all_other_ids if str(uid) not in connected_ids]
+            if not offline_ids:
+                return
+
+            sender = await db.get(User, sender_id)
+            sender_name = (sender.display_name or "PrivaChat") if sender else "PrivaChat"
+            sender_private_number = sender.private_number if sender else ""
+
+            await send_push_to_users(
+                user_ids=offline_ids,
+                title=sender_name,
+                body="New message",
+                data={
+                    "conversation_id": str(conversation_id),
+                    "message_id": str(message_id),
+                    "contact_name": sender_name,
+                    "contact_private_number": sender_private_number,
+                },
+                db=db,
+            )
+    except Exception:
+        logger.exception("[push] Failed to send new-message push")
 
 
 async def _handle_reaction(

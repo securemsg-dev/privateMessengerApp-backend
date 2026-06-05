@@ -25,6 +25,7 @@ class MessageType(str, enum.Enum):
     text = "text"
     voice = "voice"
     image = "image"
+    document = "document"
 
 
 class MessageMetadata(UUIDPrimaryKeyMixin, TimestampMixin, Base):
