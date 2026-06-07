@@ -35,7 +35,9 @@ from sqlalchemy import and_, exists, select
 
 from app.core.security import verify_access_token
 from app.db.models.conversation import conversation_participants
+from app.db.models.user import User
 from app.db.session import AsyncSessionLocal
+from app.services.push_service import send_push_to_users
 from app.websocket.manager import manager
 
 import redis.asyncio as aioredis
@@ -135,6 +137,35 @@ async def user_websocket_endpoint(
                 **{k: v for k, v in data.items() if k != "to_user_id"},
                 "from_user_id": user_id_str,
             }
+
+            # For a fresh incoming call, enrich the offer with the caller's
+            # identity (so the recipient screen shows a name, not "Unknown")
+            # and fire a push notification so a backgrounded/closed recipient
+            # is still rung. Best-effort: never let a DB/Expo hiccup block the
+            # signaling itself.
+            if event_type == "call_offer":
+                try:
+                    async with AsyncSessionLocal() as db:
+                        caller = await db.get(User, user_id)
+                        caller_name = (
+                            (caller.display_name or "PrivaChat") if caller else "PrivaChat"
+                        )
+                        caller_number = caller.private_number if caller else ""
+                        forwarded["caller_display_name"] = caller_name
+                        forwarded["caller_private_number"] = caller_number
+                        await send_push_to_users(
+                            user_ids=[to_user_id],
+                            title=caller_name,
+                            body="Incoming call",
+                            data={
+                                "type": "incoming_call",
+                                "caller_private_number": caller_number,
+                            },
+                            db=db,
+                        )
+                except Exception:
+                    logger.exception("call_offer enrichment/push failed")
+
             await manager.publish_to_user(redis, str(to_user_id), forwarded)
 
     except WebSocketDisconnect:
