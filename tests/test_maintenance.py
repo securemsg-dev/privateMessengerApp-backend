@@ -13,6 +13,7 @@ from unittest.mock import patch
 import pytest
 
 from app.core.security import hash_password
+from app.db.models.call import Call
 from app.db.models.media_blob import MediaBlob
 from app.db.models.session import Session
 from app.db.models.user import User
@@ -88,7 +89,7 @@ async def test_sweep_removes_abandoned_blobs_and_expired_sessions(tmp_path, db_s
 
     with patch("app.services.maintenance.AsyncSessionLocal", TestSessionLocal), \
          patch("app.services.maintenance.get_storage", return_value=storage):
-        blobs_removed, sessions_removed = await sweep_once()
+        blobs_removed, sessions_removed, _ = await sweep_once()
 
     assert blobs_removed == 1
     assert sessions_removed == 1
@@ -99,3 +100,51 @@ async def test_sweep_removes_abandoned_blobs_and_expired_sessions(tmp_path, db_s
         assert await session.get(MediaBlob, pending_id) is not None
         assert await session.get(MediaBlob, uploaded_id) is not None
         assert await session.get(Session, live_sess_id) is not None
+
+
+@pytest.mark.asyncio
+async def test_sweep_closes_stale_calls(tmp_path, db_session):
+    caller_id = await _make_user("9100000002")
+    callee_id = await _make_user("9100000003")
+    storage = LocalFileStorage(base_path=str(tmp_path), ttl_seconds=600)
+
+    async with TestSessionLocal() as session:
+        # Stale, never answered → missed
+        stale_unanswered = Call(
+            caller_id=caller_id, callee_id=callee_id,
+            started_at=_now() - timedelta(hours=3),
+        )
+        # Stale, was connected but never hung up → completed
+        stale_connected = Call(
+            caller_id=caller_id, callee_id=callee_id,
+            started_at=_now() - timedelta(hours=3),
+            accepted_at=_now() - timedelta(hours=3),
+        )
+        # Fresh ringing call — must be left alone
+        ringing = Call(
+            caller_id=caller_id, callee_id=callee_id,
+            started_at=_now(),
+        )
+        session.add_all([stale_unanswered, stale_connected, ringing])
+        await session.commit()
+        unanswered_id = stale_unanswered.id
+        connected_id = stale_connected.id
+        ringing_id = ringing.id
+
+    with patch("app.services.maintenance.AsyncSessionLocal", TestSessionLocal), \
+         patch("app.services.maintenance.get_storage", return_value=storage):
+        _, _, calls_closed = await sweep_once()
+
+    assert calls_closed == 2
+    async with TestSessionLocal() as session:
+        unanswered = await session.get(Call, unanswered_id)
+        assert unanswered.end_reason == "missed"
+        assert unanswered.ended_at is not None
+
+        connected = await session.get(Call, connected_id)
+        assert connected.end_reason == "completed"
+        assert connected.ended_at is not None
+
+        still_ringing = await session.get(Call, ringing_id)
+        assert still_ringing.ended_at is None
+        assert still_ringing.end_reason is None
