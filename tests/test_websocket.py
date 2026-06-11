@@ -19,12 +19,13 @@ import uuid
 from unittest.mock import patch
 
 import pytest
-from sqlalchemy import insert
+from sqlalchemy import insert, select
 from sqlalchemy.ext.asyncio import AsyncSession
 from starlette.testclient import TestClient
 
 from app.core.security import create_access_token, hash_password
 from app.db.models.conversation import Conversation, conversation_participants
+from app.db.models.message import MessageMetadata
 from app.db.models.user import User
 from app.db.session import get_session
 from app.main import create_app
@@ -104,11 +105,18 @@ async def _setup_user_only(identifier: str) -> uuid.UUID:
 
 
 @pytest.fixture
-def ws_app(fake_redis):
+def ws_app():
     """Create a test app configured for WebSocket testing.
 
-    Patches AsyncSessionLocal in the websocket router to use the test DB.
+    Patches AsyncSessionLocal in the websocket router to use the test DB,
+    swaps Redis for an in-memory fake (created inside the app's own event
+    loop when the lifespan runs), and parks the maintenance sweeper so it
+    doesn't touch the real database during tests.
     """
+    import asyncio
+
+    import fakeredis
+
     from app.core.limiter import limiter
     limiter.enabled = False
 
@@ -121,16 +129,26 @@ def ws_app(fake_redis):
             yield session
 
     app.dependency_overrides[get_session] = _override_get_session
-    app.state.redis = fake_redis
 
-    with patch("app.websocket.router.AsyncSessionLocal", TestSessionLocal):
+    with patch(
+        "app.main.aioredis.from_url",
+        side_effect=lambda *a, **k: fakeredis.FakeAsyncRedis(decode_responses=False),
+    ), patch(
+        "app.main.run_maintenance_loop",
+        new=lambda: asyncio.sleep(3600),
+    ), patch(
+        "app.websocket.router.AsyncSessionLocal", TestSessionLocal,
+    ):
         yield app
 
 
 @pytest.fixture
 def ws_client(ws_app):
-    """Synchronous TestClient for WebSocket testing."""
-    return TestClient(ws_app)
+    """TestClient with the lifespan running — this starts the Redis pub/sub
+    subscriber, which fans published events back out to local sockets (the
+    sender's echo, peers' messages, receipts)."""
+    with TestClient(ws_app) as client:
+        yield client
 
 
 # ── WS Authentication ────────────────────────────────────────────────────────
@@ -212,7 +230,8 @@ async def test_ws_send_invalid_json(ws_client):
     with ws_client.websocket_connect(f"/ws/{conv_id}?token={token}") as ws:
         ws.send_text("not json")
         resp = json.loads(ws.receive_text())
-        assert resp["error"] == "Invalid JSON"
+        assert resp["type"] == "error"
+        assert resp["detail"] == "Invalid JSON"
 
 
 @pytest.mark.asyncio
@@ -228,20 +247,44 @@ async def test_ws_send_unknown_message_type(ws_client):
             "self_destruct": False,
         }))
         resp = json.loads(ws.receive_text())
-        assert "Unknown message_type" in resp["error"]
+        assert resp["type"] == "error"
+        assert "Unknown message_type" in resp["detail"]
 
 
-def _send_and_sync(ws, payload: dict) -> None:
+def _send_and_sync(ws, payload: dict) -> dict:
     """Send a valid message, then send invalid JSON as a sync barrier.
 
-    The server processes messages sequentially. By sending invalid JSON after
-    the real message and waiting for the error response, we ensure the DB
-    commit from the real message has completed before we close the connection.
+    The server processes inbound frames sequentially, so the "Invalid JSON"
+    error reply guarantees the real message was committed. The sender also
+    receives its own message echo via pub/sub, racing with the error frame —
+    so drain frames until the barrier error arrives, collecting the echo.
+
+    Returns the echoed message event (asserted to exist and match).
     """
     ws.send_text(json.dumps(payload))
     ws.send_text("__sync__")
-    resp = json.loads(ws.receive_text())
-    assert resp["error"] == "Invalid JSON"
+
+    echo: dict | None = None
+    for _ in range(10):  # bounded: echo + error are the only expected frames
+        resp = json.loads(ws.receive_text())
+        if resp.get("type") == "error":
+            assert resp["detail"] == "Invalid JSON"
+            break
+        if resp.get("type") == "message":
+            echo = resp
+    else:
+        raise AssertionError("Never received the sync-barrier error frame")
+
+    # The echo may lag the barrier error (pub/sub round-trip) — wait for it.
+    if echo is None:
+        resp = json.loads(ws.receive_text())
+        assert resp.get("type") == "message"
+        echo = resp
+
+    assert echo["encrypted_payload"] == payload["encrypted_payload"]
+    assert echo["message_type"] == payload["message_type"]
+    assert echo["message_id"]
+    return echo
 
 
 @pytest.mark.asyncio
@@ -284,3 +327,74 @@ async def test_ws_send_image_message(ws_client):
             "message_type": "image",
             "self_destruct": False,
         })
+
+
+# ── WS Two-user flow (send → echo → delivery → read) ────────────────────────
+
+async def _user_id_by_identifier(identifier: str) -> uuid.UUID:
+    """Look up a user created by `_setup_user_and_conversation`'s extra arg."""
+    async with TestSessionLocal() as session:
+        result = await session.execute(
+            select(User).where(User.private_number == _to_private_number(identifier))
+        )
+        return result.scalar_one().id
+
+
+@pytest.mark.asyncio
+async def test_ws_full_message_flow_two_users(ws_client):
+    """End-to-end happy path: A sends, B receives, B acks delivery + read."""
+    user_a_id, conv_id = await _setup_user_and_conversation(
+        "+60300000010", extra_identifier="+60300000011",
+    )
+    user_b_id = await _user_id_by_identifier("+60300000011")
+
+    token_a = create_access_token(user_a_id)
+    token_b = create_access_token(user_b_id)
+
+    with ws_client.websocket_connect(f"/ws/{conv_id}?token={token_a}") as ws_a, \
+         ws_client.websocket_connect(f"/ws/{conv_id}?token={token_b}") as ws_b:
+
+        # A sends a message
+        ws_a.send_text(json.dumps({
+            "type": "message",
+            "encrypted_payload": "cipher-blob",
+            "message_type": "text",
+            "self_destruct": False,
+            "client_temp_id": "tmp-1",
+        }))
+
+        # B receives it
+        evt_b = json.loads(ws_b.receive_text())
+        assert evt_b["type"] == "message"
+        assert evt_b["conversation_id"] == str(conv_id)
+        assert evt_b["sender_id"] == str(user_a_id)
+        assert evt_b["encrypted_payload"] == "cipher-blob"
+        msg_id = evt_b["message_id"]
+
+        # A receives its own echo, carrying the client_temp_id for
+        # optimistic-row reconciliation
+        echo_a = json.loads(ws_a.receive_text())
+        assert echo_a["type"] == "message"
+        assert echo_a["message_id"] == msg_id
+        assert echo_a["client_temp_id"] == "tmp-1"
+
+        # B acks delivery → A sees the delivery receipt
+        ws_b.send_text(json.dumps({"type": "delivery", "message_id": msg_id}))
+        receipt = json.loads(ws_a.receive_text())
+        assert receipt["type"] == "delivery"
+        assert receipt["message_id"] == msg_id
+        assert receipt["by_user_id"] == str(user_b_id)
+
+        # B reads → A sees the read receipt
+        ws_b.send_text(json.dumps({"type": "read", "message_id": msg_id}))
+        receipt = json.loads(ws_a.receive_text())
+        assert receipt["type"] == "read"
+        assert receipt["message_id"] == msg_id
+
+    # Receipts are persisted, not just broadcast
+    async with TestSessionLocal() as session:
+        msg = (await session.execute(
+            select(MessageMetadata).where(MessageMetadata.id == uuid.UUID(msg_id))
+        )).scalar_one()
+        assert msg.delivered_at is not None
+        assert msg.read_at is not None

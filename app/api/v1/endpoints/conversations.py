@@ -125,10 +125,37 @@ async def _load_pref(
     return result.scalar_one_or_none()
 
 
+async def _unread_counts_for(
+    db,
+    conversation_ids: list[UUID],
+    current_user_id: UUID,
+) -> dict[UUID, int]:
+    """
+    One grouped query for unread counts across a batch of conversations.
+    Saves us from N+1 when hydrating the full chat list.
+    """
+    if not conversation_ids:
+        return {}
+    rows = (await db.execute(
+        select(
+            MessageMetadata.conversation_id,
+            func.count(MessageMetadata.id),
+        )
+        .where(
+            MessageMetadata.conversation_id.in_(conversation_ids),
+            MessageMetadata.sender_id != current_user_id,
+            MessageMetadata.read_at.is_(None),
+        )
+        .group_by(MessageMetadata.conversation_id)
+    )).all()
+    return {conv_id: int(count) for conv_id, count in rows}
+
+
 async def _hydrate_conversation(
     db,
     conv: Conversation,
     current_user_id: UUID,
+    unread: Optional[int] = None,
 ) -> ConversationResponse:
     """Fold a Conversation + last message + other participant + caller's prefs."""
     last_msg = await _last_message(db, conv.id)
@@ -137,14 +164,16 @@ async def _hydrate_conversation(
 
     # Unread count: messages from the other participant with no read_at,
     # received by the current user. For 1:1, "from other" = sender_id != self.
-    unread_q = await db.execute(
-        select(func.count(MessageMetadata.id)).where(
-            MessageMetadata.conversation_id == conv.id,
-            MessageMetadata.sender_id != current_user_id,
-            MessageMetadata.read_at.is_(None),
+    # The list endpoint precomputes this in one batch query and passes it in.
+    if unread is None:
+        unread_q = await db.execute(
+            select(func.count(MessageMetadata.id)).where(
+                MessageMetadata.conversation_id == conv.id,
+                MessageMetadata.sender_id != current_user_id,
+                MessageMetadata.read_at.is_(None),
+            )
         )
-    )
-    unread = int(unread_q.scalar() or 0)
+        unread = int(unread_q.scalar() or 0)
 
     return ConversationResponse(
         id=conv.id,
@@ -259,9 +288,16 @@ async def list_conversations(
     )
     convs = rows.scalars().all()
 
-    # Hydrate each conversation (N+1 — fine for Phase A volumes; revisit
-    # with a window-function query when conversations-per-user gets large).
-    out = [await _hydrate_conversation(db, c, current_user.id) for c in convs]
+    # Unread counts come from one grouped query; the remaining per-conversation
+    # lookups (last message / other participant / prefs) are fine for Phase A
+    # volumes — revisit with window functions when conversations-per-user grows.
+    unread_map = await _unread_counts_for(db, [c.id for c in convs], current_user.id)
+    out = [
+        await _hydrate_conversation(
+            db, c, current_user.id, unread=unread_map.get(c.id, 0),
+        )
+        for c in convs
+    ]
 
     # Sort by last-message recency (falls back to conv.created_at when empty)
     out.sort(

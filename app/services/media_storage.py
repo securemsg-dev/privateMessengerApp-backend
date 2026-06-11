@@ -22,6 +22,7 @@ The blobs themselves are CIPHERTEXT — the server never holds keys. This
 class deliberately does not know or care about the contents.
 """
 
+import asyncio
 import logging
 import os
 from abc import ABC, abstractmethod
@@ -60,6 +61,10 @@ class StorageBackend(ABC):
     async def read_bytes(self, blob_id: UUID) -> Optional[bytes]:
         """Return ciphertext, or None if the blob hasn't been uploaded yet."""
 
+    @abstractmethod
+    async def delete_bytes(self, blob_id: UUID) -> None:
+        """Remove stored ciphertext for a blob. No-op if nothing was written."""
+
 
 # ── Local filesystem (default — works out of the box) ────────────────────────
 
@@ -91,16 +96,34 @@ class LocalFileStorage(StorageBackend):
 
     async def write_bytes(self, blob_id: UUID, data: bytes) -> None:
         path = self._path(blob_id)
-        # Atomic write: tmp file + rename
-        tmp = path.with_suffix(".tmp")
-        tmp.write_bytes(data)
-        tmp.replace(path)
+
+        def _write() -> None:
+            # Atomic write: tmp file + rename
+            tmp = path.with_suffix(".tmp")
+            tmp.write_bytes(data)
+            tmp.replace(path)
+
+        # Keep blocking file I/O off the event loop.
+        await asyncio.to_thread(_write)
 
     async def read_bytes(self, blob_id: UUID) -> Optional[bytes]:
         path = self._path(blob_id)
-        if not path.exists():
-            return None
-        return path.read_bytes()
+
+        def _read() -> Optional[bytes]:
+            if not path.exists():
+                return None
+            return path.read_bytes()
+
+        return await asyncio.to_thread(_read)
+
+    async def delete_bytes(self, blob_id: UUID) -> None:
+        path = self._path(blob_id)
+
+        def _delete() -> None:
+            path.unlink(missing_ok=True)
+            path.with_suffix(".tmp").unlink(missing_ok=True)
+
+        await asyncio.to_thread(_delete)
 
 
 # ── S3 (stub — fill in when bucket + creds are ready) ────────────────────────
@@ -164,6 +187,12 @@ class S3Storage(StorageBackend):
             "S3Storage.read_bytes — paste boto3 get_object here"
         )
 
+    async def delete_bytes(self, blob_id: UUID) -> None:
+        # TODO: self._s3.delete_object(Bucket=self.bucket, Key=...)
+        raise NotImplementedError(
+            "S3Storage.delete_bytes — paste boto3 delete_object here"
+        )
+
 
 # ── Factory ──────────────────────────────────────────────────────────────────
 
@@ -177,12 +206,13 @@ def get_storage() -> StorageBackend:
         return _storage
 
     if settings.MEDIA_STORAGE_BACKEND == "s3":
-        _storage = S3Storage(
-            bucket=settings.AWS_S3_BUCKET_NAME,
-            region=settings.AWS_REGION,
-            access_key=settings.AWS_ACCESS_KEY_ID,
-            secret_key=settings.AWS_SECRET_ACCESS_KEY,
-            presign_ttl_seconds=settings.AWS_S3_PRESIGN_EXPIRY_SECONDS,
+        # S3Storage is still a stub — fail loudly at startup rather than on
+        # the first media request in production. Remove this guard once the
+        # boto3 methods below are implemented.
+        raise RuntimeError(
+            "MEDIA_STORAGE_BACKEND=s3 is not supported yet: S3Storage is a "
+            "stub (methods raise NotImplementedError). Use MEDIA_STORAGE_BACKEND=local "
+            "with a persistent volume, or implement S3Storage first."
         )
     else:
         _storage = LocalFileStorage(

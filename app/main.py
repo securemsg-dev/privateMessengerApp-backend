@@ -34,6 +34,8 @@ from app.api.v1.router import api_router
 from app.core.config import settings
 from app.core.limiter import limiter
 from app.db.session import engine
+from app.services.maintenance import run_maintenance_loop
+from app.services.media_storage import get_storage
 from app.websocket.manager import manager
 from app.websocket.router import router as ws_router
 from app.websocket.user_router import router as user_ws_router
@@ -52,6 +54,10 @@ async def lifespan(app: FastAPI):
     # ── Startup ───────────────────────────────────────────────────────────
     logger.info("Starting %s [%s]", settings.APP_NAME, settings.APP_ENV)
 
+    # Fail fast if the configured media backend is unusable (e.g. the S3
+    # stub) instead of erroring on the first upload in production.
+    get_storage()
+
     # Connect to Redis
     redis_client = aioredis.from_url(settings.REDIS_URL, decode_responses=False)
     app.state.redis = redis_client
@@ -64,15 +70,23 @@ async def lifespan(app: FastAPI):
     )
     logger.info("Redis pub/sub subscriber started")
 
+    # Hourly housekeeping: abandoned media blobs + expired sessions
+    maintenance_task = asyncio.create_task(
+        run_maintenance_loop(),
+        name="maintenance-sweeper",
+    )
+    logger.info("Maintenance sweeper started")
+
     yield
 
     # ── Shutdown ──────────────────────────────────────────────────────────
     logger.info("Shutting down %s", settings.APP_NAME)
-    subscriber_task.cancel()
-    try:
-        await subscriber_task
-    except asyncio.CancelledError:
-        pass
+    for task in (subscriber_task, maintenance_task):
+        task.cancel()
+        try:
+            await task
+        except asyncio.CancelledError:
+            pass
 
     await redis_client.aclose()
     await engine.dispose()
