@@ -46,6 +46,10 @@ def _build_ice_servers() -> list[IceServer]:
 @router.get(
     "/config",
     response_model=WebRTCConfigResponse,
+    # Never emit `"username": null` / `"credential": null` — react-native-webrtc's
+    # native RTCPeerConnection throws "Exception in HostFunction: username == null"
+    # on entries that carry the key with a null value (browsers ignore it).
+    response_model_exclude_none=True,
     status_code=status.HTTP_200_OK,
     summary="ICE server configuration for WebRTC peer connections",
 )
