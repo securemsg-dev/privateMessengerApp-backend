@@ -116,7 +116,8 @@ class ConnectionManager:
     ) -> None:
         """Publish to a single user's channel — for call signaling, etc."""
         channel = f"{USER_CHANNEL_PREFIX}:{user_id}"
-        await redis.publish(channel, json.dumps(message))
+        n = await redis.publish(channel, json.dumps(message))
+        logger.info("publish_to_user channel=%s subscribers=%s", channel, n)
 
     # ── Local broadcast (called by subscriber) ────────────────────────────────
 
@@ -177,6 +178,7 @@ class ConnectionManager:
             try:
                 channel: str = raw_message["channel"].decode()
                 data: str = raw_message["data"].decode()
+                logger.info("pubsub pmessage channel=%s", channel)
                 if channel.startswith(f"{CONV_CHANNEL_PREFIX}:"):
                     conversation_id = channel.split(":", 1)[1]
                     await self.broadcast_to_conversation(conversation_id, data)
