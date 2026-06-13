@@ -142,6 +142,9 @@ class ConnectionManager:
     async def broadcast_to_user(self, user_id: str, data: str) -> None:
         """Send `data` to every WebSocket the target user has open on THIS instance."""
         sockets = self._user_connections.get(user_id, [])
+        logger.info(
+            "Deliver to user=%s — %d local socket(s)", user_id, len(sockets)
+        )
         disconnected: list[WebSocket] = []
         for ws in sockets:
             try:

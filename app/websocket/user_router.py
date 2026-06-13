@@ -105,6 +105,10 @@ async def user_websocket_endpoint(
 
             event_type = data.get("type")
             if event_type not in ALLOWED_FORWARD_TYPES:
+                logger.info(
+                    "Signal rejected (unknown type %r) from user=%s",
+                    event_type, user_id_str,
+                )
                 await websocket.send_text(
                     json.dumps(
                         {"type": "error", "detail": f"Unknown type: {event_type!r}"}
@@ -116,15 +120,28 @@ async def user_websocket_endpoint(
             try:
                 to_user_id = UUID(raw_to)
             except (ValueError, TypeError):
+                logger.info(
+                    "Signal rejected (bad to_user_id %r) type=%s from user=%s",
+                    raw_to, event_type, user_id_str,
+                )
                 await websocket.send_text(
                     json.dumps({"type": "error", "detail": "Invalid to_user_id"})
                 )
                 continue
 
+            logger.info(
+                "Signal recv type=%s from=%s to=%s",
+                event_type, user_id_str, to_user_id,
+            )
+
             # Anti-spam: only forward signaling between users that share at
             # least one conversation. This means you can only call people
             # you have a chat with.
             if not await _share_a_conversation(user_id, to_user_id):
+                logger.info(
+                    "Signal DROPPED (no shared conversation) type=%s from=%s to=%s",
+                    event_type, user_id_str, to_user_id,
+                )
                 await websocket.send_text(
                     json.dumps(
                         {"type": "error", "detail": "Recipient unreachable"}
@@ -167,6 +184,10 @@ async def user_websocket_endpoint(
                     logger.exception("call_offer enrichment/push failed")
 
             await manager.publish_to_user(redis, str(to_user_id), forwarded)
+            logger.info(
+                "Signal forwarded type=%s from=%s to=%s",
+                event_type, user_id_str, to_user_id,
+            )
 
     except WebSocketDisconnect:
         await manager.disconnect_user(websocket, user_id_str)
