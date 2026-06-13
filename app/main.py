@@ -126,8 +126,14 @@ def create_app() -> FastAPI:
     # ── Routes ────────────────────────────────────────────────────────────
     app.include_router(health.router)  # /health at root
     app.include_router(api_router, prefix="/api/v1")
-    app.include_router(ws_router)       # WebSocket at /ws/{conversation_id}
+    # ORDER MATTERS: the static /ws/user route MUST be registered before the
+    # parametrized /ws/{conversation_id} route. Starlette matches in
+    # registration order, and "/ws/user" otherwise matches /ws/{conversation_id}
+    # with conversation_id="user" — which fails UUID coercion and rejects the
+    # connection with 403 before accept(). That collision silently broke ALL
+    # call signaling (the per-user WS never connected).
     app.include_router(user_ws_router)  # WebSocket at /ws/user (Phase E call signaling)
+    app.include_router(ws_router)       # WebSocket at /ws/{conversation_id}
 
     return app
 

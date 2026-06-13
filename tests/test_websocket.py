@@ -138,6 +138,8 @@ def ws_app():
         new=lambda: asyncio.sleep(3600),
     ), patch(
         "app.websocket.router.AsyncSessionLocal", TestSessionLocal,
+    ), patch(
+        "app.websocket.user_router.AsyncSessionLocal", TestSessionLocal,
     ):
         yield app
 
@@ -217,6 +219,73 @@ async def test_ws_connect_success(ws_client):
     with ws_client.websocket_connect(f"/ws/{conv_id}?token={token}") as ws:
         # Connection succeeded — just close cleanly
         pass
+
+
+# ── Per-user signaling WS (call offers) — route-collision regression ───────────
+
+@pytest.mark.asyncio
+async def test_user_ws_connect_success(ws_client):
+    """
+    Regression: /ws/user must NOT collide with /ws/{conversation_id}.
+
+    If the parametrized route is registered first, "/ws/user" matches it with
+    conversation_id="user", fails UUID coercion, and is rejected with 403 —
+    silently breaking ALL call signaling. A valid token must connect here.
+    """
+    user_id = await _setup_user_only("+60300000020")
+    token = create_access_token(user_id)
+
+    with ws_client.websocket_connect(f"/ws/user?token={token}") as ws:
+        # Connected — the route resolved to the user signaling endpoint, not
+        # the conversation endpoint. Sending garbage gets a JSON error back,
+        # proving we're talking to the user_router receive loop.
+        ws.send_text("not json")
+        resp = json.loads(ws.receive_text())
+        assert resp["type"] == "error"
+        assert resp["detail"] == "Invalid JSON"
+
+
+@pytest.mark.asyncio
+async def test_user_ws_invalid_token_rejected(ws_client):
+    """A bad token on /ws/user must be rejected, not accepted."""
+    with pytest.raises(Exception):
+        with ws_client.websocket_connect("/ws/user?token=garbage"):
+            pass
+
+
+@pytest.mark.asyncio
+async def test_user_ws_call_offer_forwarded_to_callee(ws_client):
+    """
+    End-to-end signaling: a call_offer from the caller is delivered to the
+    callee's /ws/user socket (enriched with from_user_id + caller identity).
+    """
+    caller_id, conv_id = await _setup_user_and_conversation("+60300000021")
+    # Add a callee to the SAME conversation so _share_a_conversation passes.
+    callee_id = await _setup_user_only("+60300000022")
+    async with TestSessionLocal() as session:
+        await session.execute(
+            conversation_participants.insert().values(
+                conversation_id=conv_id, user_id=callee_id
+            )
+        )
+        await session.commit()
+
+    caller_token = create_access_token(caller_id)
+    callee_token = create_access_token(callee_id)
+
+    with ws_client.websocket_connect(f"/ws/user?token={callee_token}") as callee_ws, \
+         ws_client.websocket_connect(f"/ws/user?token={caller_token}") as caller_ws:
+        caller_ws.send_text(json.dumps({
+            "type": "call_offer",
+            "to_user_id": str(callee_id),
+            "conversation_id": str(conv_id),
+            "call_id": str(uuid.uuid4()),
+            "sdp": "v=0...",
+        }))
+        offer = json.loads(callee_ws.receive_text())
+        assert offer["type"] == "call_offer"
+        assert offer["from_user_id"] == str(caller_id)
+        assert offer["sdp"] == "v=0..."
 
 
 # ── WS Messaging ─────────────────────────────────────────────────────────────
