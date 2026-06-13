@@ -157,36 +157,69 @@ class ConnectionManager:
 
     # ── Redis subscriber loop ─────────────────────────────────────────────────
 
+    async def _route_pmessage(self, raw_message: dict) -> None:
+        """Route one pmessage dict to the right local broadcaster."""
+        if raw_message is None or raw_message.get("type") != "pmessage":
+            return
+        try:
+            ch = raw_message["channel"]
+            channel: str = ch.decode() if isinstance(ch, (bytes, bytearray)) else ch
+            d = raw_message["data"]
+            data: str = d.decode() if isinstance(d, (bytes, bytearray)) else d
+            logger.info("pubsub pmessage channel=%s", channel)
+            if channel.startswith(f"{CONV_CHANNEL_PREFIX}:"):
+                conversation_id = channel.split(":", 1)[1]
+                await self.broadcast_to_conversation(conversation_id, data)
+            elif channel.startswith(f"{USER_CHANNEL_PREFIX}:"):
+                user_id = channel.split(":", 1)[1]
+                await self.broadcast_to_user(user_id, data)
+        except Exception:
+            logger.exception("Error processing pub/sub message")
+
     async def start_subscriber(self, redis: aioredis.Redis) -> None:
         """
         Long-running async task: subscribe to BOTH conversation:* and user:*
         channel families and route incoming pub/sub messages to the right
         local broadcaster. Run once at app startup as a background task.
-        """
-        pubsub = redis.pubsub()
-        await pubsub.psubscribe(
-            f"{CONV_CHANNEL_PREFIX}:*",
-            f"{USER_CHANNEL_PREFIX}:*",
-        )
-        logger.info(
-            "Redis pub/sub subscriber started (conversation + user channels)"
-        )
 
-        async for raw_message in pubsub.listen():
-            if raw_message["type"] != "pmessage":
-                continue
+        Uses an explicit ``get_message`` polling loop (NOT ``listen()``): the
+        async-generator form of redis-py's asyncio PubSub can silently stop
+        yielding pmessages against a real server even while PUBLISH reports
+        subscribers>0 — which previously broke ALL real-time delivery (calls
+        AND live chat). Polling actively pumps the socket and lets us recover
+        the subscription if the connection drops, so the task never dies
+        silently.
+        """
+        import asyncio
+
+        patterns = (f"{CONV_CHANNEL_PREFIX}:*", f"{USER_CHANNEL_PREFIX}:*")
+
+        while True:
+            pubsub = redis.pubsub()
             try:
-                channel: str = raw_message["channel"].decode()
-                data: str = raw_message["data"].decode()
-                logger.info("pubsub pmessage channel=%s", channel)
-                if channel.startswith(f"{CONV_CHANNEL_PREFIX}:"):
-                    conversation_id = channel.split(":", 1)[1]
-                    await self.broadcast_to_conversation(conversation_id, data)
-                elif channel.startswith(f"{USER_CHANNEL_PREFIX}:"):
-                    user_id = channel.split(":", 1)[1]
-                    await self.broadcast_to_user(user_id, data)
+                await pubsub.psubscribe(*patterns)
+                logger.info(
+                    "Redis pub/sub subscriber started (conversation + user channels)"
+                )
+                while True:
+                    message = await pubsub.get_message(
+                        ignore_subscribe_messages=True, timeout=1.0
+                    )
+                    if message is not None:
+                        await self._route_pmessage(message)
+            except asyncio.CancelledError:
+                # App shutdown — unwind cleanly.
+                await pubsub.aclose()
+                raise
             except Exception:
-                logger.exception("Error processing pub/sub message")
+                logger.exception(
+                    "pub/sub subscriber loop error; resubscribing in 1s"
+                )
+                try:
+                    await pubsub.aclose()
+                except Exception:
+                    pass
+                await asyncio.sleep(1)
 
 
 # Singleton — shared across the app lifecycle
