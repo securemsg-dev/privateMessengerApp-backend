@@ -184,7 +184,10 @@ async def user_websocket_endpoint(
                     logger.exception("call_offer enrichment/push failed")
 
             await manager.publish_to_user(redis, str(to_user_id), forwarded)
-            logger.info(
+            # call_ice fires many times per call — keep it at debug. The
+            # offer/answer/end events are the useful low-volume signals.
+            log = logger.debug if event_type == "call_ice" else logger.info
+            log(
                 "Signal forwarded type=%s from=%s to=%s",
                 event_type, user_id_str, to_user_id,
             )

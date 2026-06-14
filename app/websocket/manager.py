@@ -117,7 +117,10 @@ class ConnectionManager:
         """Publish to a single user's channel — for call signaling, etc."""
         channel = f"{USER_CHANNEL_PREFIX}:{user_id}"
         n = await redis.publish(channel, json.dumps(message))
-        logger.info("publish_to_user channel=%s subscribers=%s", channel, n)
+        if n == 0:
+            # No subscriber received it — the per-user signaling fan-out is
+            # down. Worth a warning since it silently breaks calls.
+            logger.warning("publish_to_user channel=%s reached 0 subscribers", channel)
 
     # ── Local broadcast (called by subscriber) ────────────────────────────────
 
@@ -143,7 +146,7 @@ class ConnectionManager:
     async def broadcast_to_user(self, user_id: str, data: str) -> None:
         """Send `data` to every WebSocket the target user has open on THIS instance."""
         sockets = self._user_connections.get(user_id, [])
-        logger.info(
+        logger.debug(
             "Deliver to user=%s — %d local socket(s)", user_id, len(sockets)
         )
         disconnected: list[WebSocket] = []
@@ -166,7 +169,7 @@ class ConnectionManager:
             channel: str = ch.decode() if isinstance(ch, (bytes, bytearray)) else ch
             d = raw_message["data"]
             data: str = d.decode() if isinstance(d, (bytes, bytearray)) else d
-            logger.info("pubsub pmessage channel=%s", channel)
+            logger.debug("pubsub pmessage channel=%s", channel)
             if channel.startswith(f"{CONV_CHANNEL_PREFIX}:"):
                 conversation_id = channel.split(":", 1)[1]
                 await self.broadcast_to_conversation(conversation_id, data)
