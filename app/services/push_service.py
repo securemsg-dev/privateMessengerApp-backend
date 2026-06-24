@@ -77,10 +77,14 @@ async def send_push_to_users(
     body: str,
     data: dict,
     db: AsyncSession,
+    channel_id: str = "messages",
 ) -> None:
     """
     Send a push notification to all devices belonging to `user_ids`.
     Silently no-ops if no push tokens are registered.
+
+    `channel_id` selects the Android notification channel the client created
+    (e.g. "messages"); ignored on iOS.
     """
     if not user_ids:
         return
@@ -110,6 +114,7 @@ async def send_push_to_users(
             "data": data,
             "sound": "default",
             "priority": "high",
+            "channelId": channel_id,
         }
         for token in tokens
     ]

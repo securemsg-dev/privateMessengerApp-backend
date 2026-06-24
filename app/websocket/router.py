@@ -63,6 +63,17 @@ logger = logging.getLogger(__name__)
 
 router = APIRouter()
 
+# Keep strong references to fire-and-forget background tasks. asyncio only
+# holds a weak reference to a bare create_task/ensure_future result, so without
+# this the GC can cancel an in-flight push/notification before it completes.
+_background_tasks: set[asyncio.Task] = set()
+
+
+def _spawn_background(coro) -> None:
+    task = asyncio.ensure_future(coro)
+    _background_tasks.add(task)
+    task.add_done_callback(_background_tasks.discard)
+
 
 async def _authenticate_websocket(token: str) -> UUID:
     """Validate the JWT passed as a query param. Raises WebSocketDisconnect on failure."""
@@ -166,56 +177,84 @@ async def _handle_message(
     }
     await manager.publish(redis, conv_id_str, event)
 
-    # Fire push notification to participants who are not currently connected
-    # to this conversation's WebSocket. Run as a background task so it doesn't
-    # add latency to the message delivery path.
-    asyncio.ensure_future(
-        _push_new_message(conversation_id, conv_id_str, user_id, msg.id)
+    # Notify the OTHER participants out-of-band: an in-app live update over
+    # their always-on user channel if they're online elsewhere (so their chat
+    # list reorders + unread ticks up without opening this chat), or an Expo
+    # push if they're fully offline. Background task so it never adds latency
+    # to the send path.
+    _spawn_background(
+        _notify_new_message(redis, conversation_id, conv_id_str, user_id, msg.id, event)
     )
 
 
-async def _push_new_message(
+async def _notify_new_message(
+    redis: aioredis.Redis,
     conversation_id: UUID,
     conv_id_str: str,
     sender_id: UUID,
     message_id: UUID,
+    event: dict,
 ) -> None:
-    """Send push notifications to offline participants after a new message."""
+    """
+    Route a freshly-sent message to each other participant by their presence:
+
+      • In THIS conversation's WS  → already got the full message; skip.
+      • Online elsewhere (user WS) → live `message_notification` for the chat
+        list; no push (the app is open, an OS banner would be noise).
+      • Fully offline              → Expo push so they're alerted.
+    """
     try:
         async with AsyncSessionLocal() as db:
-            # Participants of this conversation excluding the sender
             rows = await db.execute(
                 select(conversation_participants.c.user_id).where(
                     conversation_participants.c.conversation_id == conversation_id,
                     conversation_participants.c.user_id != sender_id,
                 )
             )
-            all_other_ids: list[UUID] = [r.user_id for r in rows]
-
-            # Only push to users who are NOT connected to this conversation WS
-            connected_ids = set(manager._conv_connections.get(conv_id_str, {}).keys())
-            offline_ids = [uid for uid in all_other_ids if str(uid) not in connected_ids]
-            if not offline_ids:
+            other_ids: list[UUID] = [r.user_id for r in rows]
+            if not other_ids:
                 return
 
             sender = await db.get(User, sender_id)
             sender_name = (sender.display_name or "PrivaChat") if sender else "PrivaChat"
             sender_private_number = sender.private_number if sender else ""
 
-            await send_push_to_users(
-                user_ids=offline_ids,
-                title=sender_name,
-                body="New message",
-                data={
-                    "conversation_id": str(conversation_id),
-                    "message_id": str(message_id),
-                    "contact_name": sender_name,
-                    "contact_private_number": sender_private_number,
-                },
-                db=db,
-            )
+            in_conversation = set(manager._conv_connections.get(conv_id_str, {}).keys())
+
+            # The user-channel event carries everything the client needs to
+            # update its conversation list (incl. the encrypted payload so it
+            # can decrypt a preview locally).
+            notification = {
+                **event,
+                "type": "message_notification",
+                "sender_name": sender_name,
+                "sender_private_number": sender_private_number,
+            }
+
+            offline_ids: list[UUID] = []
+            for uid in other_ids:
+                if str(uid) in in_conversation:
+                    continue  # already received the full message in-thread
+                if manager.is_user_connected(str(uid)):
+                    await manager.publish_to_user(redis, str(uid), notification)
+                else:
+                    offline_ids.append(uid)
+
+            if offline_ids:
+                await send_push_to_users(
+                    user_ids=offline_ids,
+                    title=sender_name,
+                    body="New message",
+                    data={
+                        "conversation_id": str(conversation_id),
+                        "message_id": str(message_id),
+                        "contact_name": sender_name,
+                        "contact_private_number": sender_private_number,
+                    },
+                    db=db,
+                )
     except Exception:
-        logger.exception("[push] Failed to send new-message push")
+        logger.exception("[push] Failed to notify on new message")
 
 
 async def _handle_reaction(

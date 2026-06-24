@@ -179,6 +179,7 @@ async def user_websocket_endpoint(
                                 "caller_private_number": caller_number,
                             },
                             db=db,
+                            channel_id="calls",
                         )
                 except Exception:
                     logger.exception("call_offer enrichment/push failed")

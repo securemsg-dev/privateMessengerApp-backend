@@ -467,3 +467,60 @@ async def test_ws_full_message_flow_two_users(ws_client):
         )).scalar_one()
         assert msg.delivered_at is not None
         assert msg.read_at is not None
+
+
+# ── Real-time spine: live message_notification over the user channel ───────────
+
+@pytest.mark.asyncio
+async def test_message_notification_delivered_to_user_socket(ws_client):
+    """
+    When a recipient is online but NOT in the conversation (only their /ws/user
+    channel is open), a new message reaches them as a `message_notification`
+    so their chat list can update live — without an Expo push.
+    """
+    user_a_id, conv_id = await _setup_user_and_conversation(
+        "+60300000030", extra_identifier="+60300000031",
+    )
+    user_b_id = await _user_id_by_identifier("+60300000031")
+    token_a = create_access_token(user_a_id)
+    token_b = create_access_token(user_b_id)
+
+    # B is online on their user channel only (NOT in the conversation WS).
+    with ws_client.websocket_connect(f"/ws/user?token={token_b}") as ws_b_user, \
+         ws_client.websocket_connect(f"/ws/{conv_id}?token={token_a}") as ws_a:
+        ws_a.send_text(json.dumps({
+            "encrypted_payload": "cipher-xyz",
+            "message_type": "text",
+            "client_temp_id": "tmp-n1",
+        }))
+        # A still gets its own echo over the conversation socket.
+        echo_a = json.loads(ws_a.receive_text())
+        assert echo_a["type"] == "message"
+
+        # B receives a live notification over the user channel.
+        note = json.loads(ws_b_user.receive_text())
+        assert note["type"] == "message_notification"
+        assert note["conversation_id"] == str(conv_id)
+        assert note["sender_id"] == str(user_a_id)
+        assert note["encrypted_payload"] == "cipher-xyz"
+        assert "sender_name" in note
+
+
+@pytest.mark.asyncio
+async def test_is_user_connected_presence():
+    """Presence helper reflects user-channel and conversation connections."""
+    from app.websocket.manager import manager
+
+    uid = str(uuid.uuid4())
+    assert manager.is_user_connected(uid) is False
+
+    class _FakeWS:
+        async def accept(self):  # connect_user calls accept()
+            return None
+
+    ws = _FakeWS()
+    await manager.connect_user(ws, uid)  # type: ignore[arg-type]
+    assert manager.is_user_connected(uid) is True
+
+    await manager.disconnect_user(ws, uid)  # type: ignore[arg-type]
+    assert manager.is_user_connected(uid) is False

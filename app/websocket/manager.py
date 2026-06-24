@@ -96,6 +96,23 @@ class ConnectionManager:
             self._user_connections.pop(user_id, None)
         logger.info("User WS disconnected: user=%s", user_id)
 
+    def is_user_connected(self, user_id: str) -> bool:
+        """
+        True if the user has ANY live socket on this instance — either their
+        always-on per-user channel OR a conversation socket. Used to decide
+        whether a new message needs an Expo push (only when fully offline) or
+        just an in-app live update over the user channel.
+
+        Note: single-instance presence. With horizontal scaling this would
+        need a shared (Redis) presence set; documented as a known limitation.
+        """
+        if self._user_connections.get(user_id):
+            return True
+        for participants in self._conv_connections.values():
+            if participants.get(user_id):
+                return True
+        return False
+
     # ── Publishing ────────────────────────────────────────────────────────────
 
     async def publish(
