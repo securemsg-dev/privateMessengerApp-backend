@@ -168,19 +168,36 @@ async def user_websocket_endpoint(
                             (caller.display_name or "PrivaChat") if caller else "PrivaChat"
                         )
                         caller_number = caller.private_number if caller else ""
+                        # Identity must ride EVERY forwarded offer — a recipient
+                        # whose WS reconnects mid-ring only sees a resent offer.
                         forwarded["caller_display_name"] = caller_name
                         forwarded["caller_private_number"] = caller_number
-                        await send_push_to_users(
-                            user_ids=[to_user_id],
-                            title=caller_name,
-                            body="Incoming call",
-                            data={
-                                "type": "incoming_call",
-                                "caller_private_number": caller_number,
-                            },
-                            db=db,
-                            channel_id="calls",
-                        )
+
+                        # …but only PUSH once per call. The caller re-sends
+                        # call_offer every few seconds while ringing, so without
+                        # this guard a sleeping callee gets a ~10× notification
+                        # storm. A Redis SET NX with the ring-timeout TTL
+                        # collapses the resends into a single notification.
+                        call_id = data.get("call_id")
+                        first_offer = True
+                        if call_id:
+                            first_offer = bool(
+                                await redis.set(
+                                    f"call_push:{call_id}", "1", nx=True, ex=35
+                                )
+                            )
+                        if first_offer:
+                            await send_push_to_users(
+                                user_ids=[to_user_id],
+                                title=caller_name,
+                                body="Incoming call",
+                                data={
+                                    "type": "incoming_call",
+                                    "caller_private_number": caller_number,
+                                },
+                                db=db,
+                                channel_id="calls",
+                            )
                 except Exception:
                     logger.exception("call_offer enrichment/push failed")
 
