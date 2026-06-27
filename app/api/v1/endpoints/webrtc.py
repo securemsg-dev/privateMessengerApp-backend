@@ -31,10 +31,17 @@ def _build_ice_servers() -> list[IceServer]:
     if stun_urls:
         servers.append(IceServer(urls=stun_urls))
 
-    if settings.WEBRTC_TURN_URL:
+    # WEBRTC_TURN_URL may list several transports (UDP/TCP :80, UDP :443,
+    # TLS turns :443) comma-separated — offering all of them lets ICE punch
+    # through restrictive/corporate networks that block plain UDP. They all
+    # share one username/credential, so they go in a single IceServer entry.
+    turn_urls = [
+        u.strip() for u in settings.WEBRTC_TURN_URL.split(",") if u.strip()
+    ]
+    if turn_urls:
         servers.append(
             IceServer(
-                urls=[settings.WEBRTC_TURN_URL],
+                urls=turn_urls,
                 username=settings.WEBRTC_TURN_USERNAME or None,
                 credential=settings.WEBRTC_TURN_PASSWORD or None,
             )

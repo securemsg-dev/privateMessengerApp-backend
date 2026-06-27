@@ -23,6 +23,7 @@ from app.core.dependencies import CurrentUser, DBSession
 from app.core.limiter import limiter
 from app.db.models.call import Call
 from app.db.models.conversation import conversation_participants
+from app.db.models.user import User
 from app.schemas.messaging import (
     CallCreateRequest,
     CallResponse,
@@ -141,4 +142,28 @@ async def list_calls(
             .limit(200)
         )
     ).scalars().all()
-    return [CallResponse.model_validate(c) for c in rows]
+
+    # Resolve the "other" party of each call to a real name/number in one query
+    # so the Calls tab never has to fall back to a raw UUID slice.
+    peer_ids = {
+        c.callee_id if c.caller_id == current_user.id else c.caller_id
+        for c in rows
+    }
+    peer_ids.discard(None)
+    peers: dict[UUID, User] = {}
+    if peer_ids:
+        peer_rows = (
+            await db.execute(select(User).where(User.id.in_(peer_ids)))
+        ).scalars().all()
+        peers = {u.id: u for u in peer_rows}
+
+    result: list[CallResponse] = []
+    for c in rows:
+        peer_id = c.callee_id if c.caller_id == current_user.id else c.caller_id
+        peer = peers.get(peer_id) if peer_id else None
+        dto = CallResponse.model_validate(c)
+        if peer is not None:
+            dto.peer_display_name = peer.display_name
+            dto.peer_private_number = peer.private_number
+        result.append(dto)
+    return result

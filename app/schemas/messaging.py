@@ -285,6 +285,10 @@ class CallResponse(BaseModel):
     accepted_at: Optional[datetime]
     ended_at: Optional[datetime]
     end_reason: Optional[CallEndReason]
+    # The OTHER party relative to the requesting user, resolved from the users
+    # table so the Calls tab can show a real name instead of a raw UUID.
+    peer_display_name: Optional[str] = None
+    peer_private_number: Optional[str] = None
 
     model_config = {"from_attributes": True}
 
