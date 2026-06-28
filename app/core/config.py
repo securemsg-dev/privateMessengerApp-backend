@@ -33,6 +33,10 @@ class Settings(BaseSettings):
     APP_NAME: str = "Private Messenger"
     DEBUG: bool = True
     SECRET_KEY: str = "changeme"
+    # Master switch for the slowapi rate limiter. Keep True in production; set
+    # False only to run authenticated load/stress tests from a single IP (which
+    # the per-IP limits would otherwise throttle). Re-enable immediately after.
+    RATE_LIMITING_ENABLED: bool = True
 
     # ── Database ─────────────────────────────────────────────────────────
     DATABASE_URL: str = "postgresql+asyncpg://postgres:postgres@localhost:5432/private_messenger"
