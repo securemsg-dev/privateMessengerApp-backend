@@ -17,6 +17,12 @@ from pydantic import BaseModel, Field, field_validator, model_validator
 
 PRIVATE_NUMBER_PATTERN = re.compile(r"^\d{10}$")
 MIN_PASSWORD_LEN = 8
+# bcrypt hard-fails (ValueError) on inputs over 72 BYTES — without this guard
+# a long passphrase turns into an HTTP 500 at registration. Measured in bytes,
+# not chars, because multi-byte characters (emoji, CJK) count several times.
+# Login deliberately has no max: verify_password() catches the ValueError and
+# returns False, so existing credentials can never be locked out by a schema.
+MAX_PASSWORD_BYTES = 72
 
 
 def validate_private_number(v: str) -> str:
@@ -25,12 +31,23 @@ def validate_private_number(v: str) -> str:
     return v
 
 
+def validate_password_bytes(v: str) -> str:
+    if len(v.encode("utf-8")) > MAX_PASSWORD_BYTES:
+        raise ValueError(f"password must be at most {MAX_PASSWORD_BYTES} bytes")
+    return v
+
+
 # ── Request schemas ───────────────────────────────────────────────────────────
 
 class RegisterRequest(BaseModel):
-    display_name: Optional[str] = None
+    display_name: Optional[str] = Field(None, max_length=100)
     login_password: str = Field(min_length=MIN_PASSWORD_LEN)
     delete_password: str = Field(min_length=MIN_PASSWORD_LEN)
+
+    @field_validator("login_password", "delete_password")
+    @classmethod
+    def _password_byte_limit(cls, v: str) -> str:
+        return validate_password_bytes(v)
 
     @model_validator(mode="after")
     def passwords_must_differ(self) -> "RegisterRequest":

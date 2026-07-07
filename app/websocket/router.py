@@ -48,6 +48,7 @@ from fastapi import APIRouter, Query, WebSocket, WebSocketDisconnect, status
 from jose import JWTError
 from sqlalchemy import select
 
+from app.core.config import settings
 from app.core.security import verify_access_token
 from app.db.models.conversation import conversation_participants
 from app.db.models.message import MessageMetadata, MessageType
@@ -56,6 +57,7 @@ from app.db.models.user import User
 from app.db.session import AsyncSessionLocal
 from app.services.push_service import send_push_to_users
 from app.websocket.manager import manager
+from app.websocket.throttle import ConnectionThrottle
 
 import redis.asyncio as aioredis
 
@@ -110,6 +112,11 @@ async def _handle_message(
 ) -> None:
     """Persist + publish a new chat message."""
     encrypted_payload = data.get("encrypted_payload", "")
+    if not isinstance(encrypted_payload, str):
+        await websocket.send_text(
+            json.dumps({"type": "error", "detail": "encrypted_payload must be a string"})
+        )
+        return
     message_type_str = data.get("message_type", "text")
     self_destruct: bool = bool(data.get("self_destruct", False))
     # Optional client-supplied dedupe id; echoed in the published event so
@@ -161,7 +168,9 @@ async def _handle_message(
         )
         db.add(msg)
         await db.commit()
-        await db.refresh(msg)
+        # No refresh needed: id/created_at are Python-side defaults, already
+        # populated before the INSERT — a refresh would be one extra SELECT
+        # round trip added to the latency of every single message.
 
     event = {
         "type": "message",
@@ -418,10 +427,21 @@ async def websocket_endpoint(
 
     redis: aioredis.Redis = websocket.app.state.redis
     await manager.connect(websocket, conv_id_str, user_id_str)
+    throttle = ConnectionThrottle(settings.WS_CONV_EVENTS_PER_10S, 10.0)
 
     try:
         while True:
             raw = await websocket.receive_text()
+            if len(raw) > settings.WS_MAX_FRAME_BYTES:
+                await websocket.send_text(
+                    json.dumps({"type": "error", "detail": "Frame too large"})
+                )
+                continue
+            if not throttle.allow():
+                await websocket.send_text(
+                    json.dumps({"type": "error", "detail": "Rate limit exceeded — slow down"})
+                )
+                continue
             try:
                 data = json.loads(raw)
             except json.JSONDecodeError:
@@ -451,5 +471,9 @@ async def websocket_endpoint(
                 )
 
     except WebSocketDisconnect:
-        await manager.disconnect(websocket, conv_id_str, user_id_str)
         logger.info("WebSocket disconnected: user=%s conv=%s", user_id_str, conv_id_str)
+    finally:
+        # Runs for ANY exit path (client disconnect, DB error inside a
+        # handler, task cancellation) — without it a crashed handler leaves
+        # a dead socket registered in the manager forever.
+        await manager.disconnect(websocket, conv_id_str, user_id_str)

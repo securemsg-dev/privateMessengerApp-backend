@@ -33,6 +33,25 @@ logger = logging.getLogger(__name__)
 EXPO_PUSH_URL = "https://exp.host/--/api/v2/push/send"
 _BATCH_SIZE = 100
 
+# One shared client for the process — building a client per send() paid a
+# fresh TCP + TLS handshake to Expo on every notification.
+_http_client: httpx.AsyncClient | None = None
+
+
+def _get_http_client() -> httpx.AsyncClient:
+    global _http_client
+    if _http_client is None or _http_client.is_closed:
+        _http_client = httpx.AsyncClient(timeout=10.0)
+    return _http_client
+
+
+async def close_http_client() -> None:
+    """Close the shared client — called from the app lifespan shutdown."""
+    global _http_client
+    if _http_client is not None and not _http_client.is_closed:
+        await _http_client.aclose()
+    _http_client = None
+
 
 async def _send_expo_batch(
     notifications: list[dict],
@@ -119,11 +138,11 @@ async def send_push_to_users(
         for token in tokens
     ]
 
-    async with httpx.AsyncClient() as http:
-        for i in range(0, len(notifications), _BATCH_SIZE):
-            await _send_expo_batch(
-                notifications[i : i + _BATCH_SIZE],
-                http,
-                db,
-                token_to_device_id,
-            )
+    http = _get_http_client()
+    for i in range(0, len(notifications), _BATCH_SIZE):
+        await _send_expo_batch(
+            notifications[i : i + _BATCH_SIZE],
+            http,
+            db,
+            token_to_device_id,
+        )

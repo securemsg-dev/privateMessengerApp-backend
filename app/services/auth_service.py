@@ -22,7 +22,8 @@ from app.core.security import (
     create_access_token,
     create_refresh_token,
     hash_password,
-    verify_password,
+    hash_password_async,
+    verify_password_async,
 )
 from app.db.models.session import Session as UserSession
 from app.db.models.user import User
@@ -61,13 +62,15 @@ async def register_user(
     private_number = await generate_unique_private_number(db)
     user = User(
         private_number=private_number,
-        login_password_hash=hash_password(login_password),
-        delete_password_hash=hash_password(delete_password),
+        login_password_hash=await hash_password_async(login_password),
+        delete_password_hash=await hash_password_async(delete_password),
         display_name=display_name,
     )
     db.add(user)
     await db.flush()
-    logger.info("New user registered: private_number=%s", private_number)
+    # Only the last 4 digits go to logs — the full number is the user's
+    # identity and log lines outlive the request (Railway retention).
+    logger.info("New user registered: private_number=******%s", private_number[-4:])
     return user
 
 
@@ -103,19 +106,23 @@ async def authenticate_or_delete_intent(
     user = result.scalar_one_or_none()
 
     if user is None:
-        # Timing equalizer — pay the bcrypt cost even though we'll reject.
-        verify_password(password, _DUMMY_BCRYPT_HASH)
+        # Timing equalizer — the known-user path below pays TWO bcrypt
+        # verifies (login + delete hash), so the unknown-number branch must
+        # pay two as well or response latency leaks which private numbers
+        # exist (~150ms difference is trivially measurable).
+        await verify_password_async(password, _DUMMY_BCRYPT_HASH)
+        await verify_password_async(password, _DUMMY_BCRYPT_HASH)
         raise ValueError("Invalid private number or password")
 
     if not user.is_active:
         # Still run both verifies for timing parity, then reject.
-        verify_password(password, user.login_password_hash)
-        verify_password(password, user.delete_password_hash)
+        await verify_password_async(password, user.login_password_hash)
+        await verify_password_async(password, user.delete_password_hash)
         raise ValueError("Account is deactivated")
 
     # Run BOTH verifies unconditionally. Do not combine into `or`.
-    login_ok = verify_password(password, user.login_password_hash)
-    delete_ok = verify_password(password, user.delete_password_hash)
+    login_ok = await verify_password_async(password, user.login_password_hash)
+    delete_ok = await verify_password_async(password, user.delete_password_hash)
 
     if login_ok:
         return AuthOutcome.AUTHENTICATED, user
@@ -140,9 +147,9 @@ async def delete_user_by_id(user_id: UUID, db: AsyncSession) -> None:
         logger.info("delete_user_by_id: user already gone | user_id=%s", user_id)
         return
     logger.info(
-        "Deleting account: user_id=%s private_number=%s",
+        "Deleting account: user_id=%s private_number=******%s",
         user.id,
-        user.private_number,
+        user.private_number[-4:],
     )
     await db.delete(user)
     await db.flush()

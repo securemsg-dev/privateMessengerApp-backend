@@ -20,6 +20,7 @@ from datetime import datetime, timezone
 from uuid import UUID
 
 from fastapi import APIRouter, HTTPException, Request, Response, status
+from fastapi.responses import FileResponse
 from sqlalchemy import select
 
 from app.core.config import settings
@@ -111,9 +112,22 @@ async def upload_blob(
         # Idempotent: re-uploading the same blob is a no-op
         return Response(status_code=status.HTTP_204_NO_CONTENT)
 
-    body = await request.body()
-    if len(body) > settings.MEDIA_MAX_BLOB_BYTES:
+    # Cheap rejection BEFORE reading anything: a hostile client could
+    # otherwise stream gigabytes into memory before the old post-read check
+    # ever ran. Content-Length can lie, so the streamed read below still
+    # enforces the cap on actual bytes received.
+    declared = request.headers.get("content-length")
+    if declared and declared.isdigit() and int(declared) > settings.MEDIA_MAX_BLOB_BYTES:
         raise HTTPException(status_code=413, detail="Blob exceeds size limit")
+
+    received = bytearray()
+    async for chunk in request.stream():
+        received.extend(chunk)
+        if len(received) > min(settings.MEDIA_MAX_BLOB_BYTES, blob.size_bytes):
+            # Abort as soon as the body exceeds what the reservation declared —
+            # don't buffer the rest.
+            raise HTTPException(status_code=413, detail="Blob exceeds declared size")
+    body = bytes(received)
     if len(body) != blob.size_bytes:
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
@@ -160,12 +174,19 @@ async def download_blob(
     if blob is None or blob.uploaded_at is None:
         raise HTTPException(status_code=404, detail="Blob not found")
 
-    storage = get_storage()
-    data = await storage.read_bytes(blob.id)
-    if data is None:
-        raise HTTPException(status_code=404, detail="Blob bytes missing")
-
     # Touch the user reference so unused 'request' isn't a hint warning;
     # in practice the @limiter.limit decorator above needs `request` too.
     _ = current_user
+
+    storage = get_storage()
+    # Stream from disk when the backend stores bytes locally — avoids holding
+    # a whole (up to 50 MB) blob in memory per request and gives clients
+    # Range support for free (voice/video seeking).
+    path = storage.local_path(blob.id)
+    if path is not None:
+        return FileResponse(path, media_type="application/octet-stream")
+
+    data = await storage.read_bytes(blob.id)
+    if data is None:
+        raise HTTPException(status_code=404, detail="Blob bytes missing")
     return Response(content=data, media_type="application/octet-stream")

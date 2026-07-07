@@ -20,6 +20,10 @@ class DeviceRegisterRequest(BaseModel):
     public_key: Optional[str] = None  # Base64-encoded X25519 public key
 
 
+class PushTokenClearRequest(BaseModel):
+    push_token: str
+
+
 class DeviceResponse(BaseModel):
     id: UUID
     device_name: str

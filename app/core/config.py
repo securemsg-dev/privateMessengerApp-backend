@@ -9,7 +9,7 @@ All settings are read once at startup from .env (or real env vars in production)
 from functools import lru_cache
 from typing import Any, Union, Optional, Literal
 
-from pydantic import AnyUrl, computed_field, field_validator
+from pydantic import AnyUrl, computed_field, field_validator, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
@@ -32,7 +32,6 @@ class Settings(BaseSettings):
     APP_ENV: Literal["development", "staging", "production"] = "development"
     APP_NAME: str = "Private Messenger"
     DEBUG: bool = True
-    SECRET_KEY: str = "changeme"
     # Master switch for the slowapi rate limiter. Keep True in production; set
     # False only to run authenticated load/stress tests from a single IP (which
     # the per-IP limits would otherwise throttle). Re-enable immediately after.
@@ -64,16 +63,10 @@ class Settings(BaseSettings):
     # and nothing else. Short-lived so a leaked token has minimal blast radius.
     DELETE_INTENT_TOKEN_EXPIRE_MINUTES: int = 5
 
-    # ── OTP ──────────────────────────────────────────────────────────────
-    OTP_MODE: Literal["mock", "aws_sns"] = "mock"
-    OTP_EXPIRY_MINUTES: int = 10
-    OTP_MAX_ATTEMPTS: int = 5
-
-    # ── AWS SNS ──────────────────────────────────────────────────────────
+    # ── AWS (S3 media backend — unused until S3Storage is implemented) ───
     AWS_REGION: str = "ap-southeast-1"
     AWS_ACCESS_KEY_ID: str = ""
     AWS_SECRET_ACCESS_KEY: str = ""
-    AWS_SNS_SENDER_ID: str = "PrivateMsg"
 
     # ── AWS S3 ───────────────────────────────────────────────────────────
     AWS_S3_BUCKET_NAME: str = "private-messenger-media"
@@ -89,6 +82,18 @@ class Settings(BaseSettings):
     MEDIA_MAX_BLOB_BYTES: int = 50 * 1024 * 1024
     # How long a freshly-issued upload URL stays valid (server clock).
     MEDIA_UPLOAD_URL_TTL_SECONDS: int = 600
+
+    # ── WebSocket protection ─────────────────────────────────────────────
+    # Largest inbound WS frame we accept. Text messages are small; media
+    # travels through the blob endpoints, so 64 KB is generous. Without a
+    # cap a client can push frames up to uvicorn's 16 MB default straight
+    # into Postgres and the Redis fan-out.
+    WS_MAX_FRAME_BYTES: int = 64 * 1024
+    # Per-connection inbound budget (events per 10s window). The user
+    # channel gets a higher budget because ICE candidates arrive in bursts
+    # during call setup.
+    WS_CONV_EVENTS_PER_10S: int = 40
+    WS_USER_EVENTS_PER_10S: int = 150
 
     # ── WebRTC (Phase E — calls) ─────────────────────────────────────────
     # Comma-separated STUN URIs. Public Google STUN works for most NAT
@@ -115,6 +120,29 @@ class Settings(BaseSettings):
     @property
     def is_production(self) -> bool:
         return self.APP_ENV == "production"
+
+    @computed_field  # type: ignore[misc]
+    @property
+    def expose_docs(self) -> bool:
+        # Interactive API docs (/docs, /redoc, /openapi.json) are a useful dev
+        # affordance but leak the full API surface. Only serve them in local
+        # development; never on a deployed (staging/production) box.
+        return self.APP_ENV == "development"
+
+    @model_validator(mode="after")
+    def _require_real_secrets(self) -> "Settings":
+        # The "changeme" defaults exist only so the app boots in local dev.
+        # On any deployed environment, a forgotten env var would otherwise
+        # silently fall back to a publicly-known secret — anyone could forge
+        # JWTs for any user. Fail fast at startup instead.
+        if self.APP_ENV != "development" and self.JWT_SECRET_KEY == "changeme":
+            raise ValueError(
+                f"Refusing to start in APP_ENV={self.APP_ENV!r}: "
+                "JWT_SECRET_KEY still set to the insecure default "
+                "'changeme'. Set a strong random value "
+                "(e.g. `openssl rand -hex 32`)."
+            )
+        return self
 
 
 @lru_cache

@@ -16,8 +16,16 @@ from app.core.config import settings
 # Individual endpoints can override with a custom key (e.g. phone number).
 # `enabled` is config-driven so authenticated load tests can switch limiting
 # off via the RATE_LIMITING_ENABLED env var (no code change). Keep it on in prod.
+#
+# Storage lives in Redis so limits survive deploys and are shared across
+# uvicorn workers/replicas — the default in-memory storage is per-process,
+# which silently multiplies every limit by the worker count. If Redis is
+# briefly unreachable, limits falls back to in-memory rather than 500ing
+# every request.
 limiter = Limiter(
     key_func=get_remote_address,
     default_limits=["200/minute"],
+    storage_uri=settings.REDIS_URL,
+    in_memory_fallback_enabled=True,
     enabled=settings.RATE_LIMITING_ENABLED,
 )

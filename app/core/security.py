@@ -5,6 +5,7 @@ app/core/security.py
 JWT creation/verification and password hashing utilities.
 """
 
+import asyncio
 import secrets
 from datetime import datetime, timedelta, timezone
 from typing import Union, Optional, Any
@@ -31,6 +32,18 @@ def verify_password(plain: str, hashed: str) -> bool:
         return bcrypt.checkpw(plain.encode("utf-8"), hashed.encode("utf-8"))
     except ValueError:
         return False
+
+
+# Async wrappers — bcrypt is ~100-250ms of pure CPU per call. Run it on a
+# worker thread so a login/register doesn't freeze the event loop (which
+# would stall every other request AND all WebSocket traffic on the process).
+
+async def hash_password_async(plain: str) -> str:
+    return await asyncio.to_thread(hash_password, plain)
+
+
+async def verify_password_async(plain: str, hashed: str) -> bool:
+    return await asyncio.to_thread(verify_password, plain, hashed)
 
 
 # ── JWT helpers ───────────────────────────────────────────────────────────────

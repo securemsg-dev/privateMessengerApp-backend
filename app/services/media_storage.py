@@ -65,6 +65,14 @@ class StorageBackend(ABC):
     async def delete_bytes(self, blob_id: UUID) -> None:
         """Remove stored ciphertext for a blob. No-op if nothing was written."""
 
+    def local_path(self, blob_id: UUID) -> Optional[Path]:
+        """
+        Filesystem path of the stored blob, or None when the backend doesn't
+        store bytes locally (S3). Lets the download endpoint stream straight
+        from disk (FileResponse) instead of loading whole blobs into memory.
+        """
+        return None
+
 
 # ── Local filesystem (default — works out of the box) ────────────────────────
 
@@ -83,6 +91,10 @@ class LocalFileStorage(StorageBackend):
 
     def _path(self, blob_id: UUID) -> Path:
         return self.base_path / f"{blob_id}.bin"
+
+    def local_path(self, blob_id: UUID) -> Optional[Path]:
+        path = self._path(blob_id)
+        return path if path.exists() else None
 
     async def issue_upload_url(self, blob_id: UUID) -> tuple[str, datetime]:
         # The client uploads via PUT /api/v1/media/{blob_id}; the URL is

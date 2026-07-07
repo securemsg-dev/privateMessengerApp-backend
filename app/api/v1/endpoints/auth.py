@@ -52,6 +52,45 @@ logger = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/auth", tags=["Authentication"])
 
+# ── Per-number brute-force lockout ───────────────────────────────────────────
+# The per-IP slowapi limit is spoofable behind a proxy (X-Forwarded-For), so
+# failed logins are ALSO counted per private_number in Redis. Successful
+# logins are never throttled by this; only failures count.
+LOGIN_FAILURES_PER_NUMBER = 10
+LOGIN_FAILURE_WINDOW_SECONDS = 300
+
+
+def _mask(private_number: str) -> str:
+    """Log-safe form of a private number: last 4 digits only."""
+    return f"******{private_number[-4:]}" if len(private_number) >= 4 else "******"
+
+
+async def _check_number_lockout(redis, private_number: str) -> None:
+    """Raise 429 when this number has too many recent failed attempts."""
+    try:
+        count = await redis.get(f"login_fail:{private_number}")
+    except Exception:
+        logger.warning("login lockout check failed (Redis unavailable) — failing open")
+        return
+    if count is None:
+        return
+    n = int(count.decode() if isinstance(count, (bytes, bytearray)) else count)
+    if n >= LOGIN_FAILURES_PER_NUMBER:
+        raise HTTPException(
+            status_code=status.HTTP_429_TOO_MANY_REQUESTS,
+            detail="Too many failed attempts. Try again in a few minutes.",
+        )
+
+
+async def _record_login_failure(redis, private_number: str) -> None:
+    try:
+        key = f"login_fail:{private_number}"
+        n = await redis.incr(key)
+        if n == 1:
+            await redis.expire(key, LOGIN_FAILURE_WINDOW_SECONDS)
+    except Exception:
+        logger.warning("login failure counter unavailable (Redis down?)")
+
 
 # ── Registration ──────────────────────────────────────────────────────────────
 
@@ -81,7 +120,7 @@ async def register(
             display_name=body.display_name,
             db=db,
         )
-        logger.info("[REGISTER] User created | id=%s private_number=%s", user.id, user.private_number)
+        logger.info("[REGISTER] User created | id=%s private_number=%s", user.id, _mask(user.private_number))
         tokens = await auth_service.create_session(user, db)
         logger.info("[REGISTER] Session created | user_id=%s", user.id)
         return RegisterResponse(
@@ -120,7 +159,12 @@ async def login(
     Any other case returns HTTP 401 with a generic error message.
     """
     client_ip = request.client.host if request.client else "unknown"
-    logger.info("[LOGIN] Request from %s | private_number=%s", client_ip, body.private_number)
+    masked = _mask(body.private_number)
+    logger.info("[LOGIN] Request from %s | private_number=%s", client_ip, masked)
+
+    redis = request.app.state.redis
+    await _check_number_lockout(redis, body.private_number)
+
     try:
         outcome, user = await auth_service.authenticate_or_delete_intent(
             private_number=body.private_number,
@@ -128,13 +172,14 @@ async def login(
             db=db,
         )
     except ValueError as exc:
-        logger.warning("[LOGIN] Auth failed | private_number=%s | reason=%s", body.private_number, exc)
+        await _record_login_failure(redis, body.private_number)
+        logger.warning("[LOGIN] Auth failed | private_number=%s | reason=%s", masked, exc)
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
             detail=str(exc),
         ) from exc
     except Exception as exc:
-        logger.exception("[LOGIN] Unexpected error | private_number=%s | error=%s", body.private_number, exc)
+        logger.exception("[LOGIN] Unexpected error | private_number=%s | error=%s", masked, exc)
         raise
 
     if outcome is AuthOutcome.AUTHENTICATED:

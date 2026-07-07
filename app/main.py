@@ -36,6 +36,7 @@ from app.core.limiter import limiter
 from app.db.session import engine
 from app.services.maintenance import run_maintenance_loop
 from app.services.media_storage import get_storage
+from app.services.push_service import close_http_client
 from app.websocket.manager import manager
 from app.websocket.router import router as ws_router
 from app.websocket.user_router import router as user_ws_router
@@ -58,8 +59,14 @@ async def lifespan(app: FastAPI):
     # stub) instead of erroring on the first upload in production.
     get_storage()
 
-    # Connect to Redis
-    redis_client = aioredis.from_url(settings.REDIS_URL, decode_responses=False)
+    # Connect to Redis. health_check_interval proactively re-validates
+    # long-idle pooled connections instead of failing the first publish
+    # after a quiet period.
+    redis_client = aioredis.from_url(
+        settings.REDIS_URL,
+        decode_responses=False,
+        health_check_interval=30,
+    )
     app.state.redis = redis_client
     logger.info("Redis connected: %s", settings.REDIS_URL)
 
@@ -88,6 +95,7 @@ async def lifespan(app: FastAPI):
         except asyncio.CancelledError:
             pass
 
+    await close_http_client()
     await redis_client.aclose()
     await engine.dispose()
     logger.info("Shutdown complete")
@@ -104,9 +112,11 @@ def create_app() -> FastAPI:
             "and real-time messaging via WebSocket with Redis pub/sub."
         ),
         version="1.0.0",
-        docs_url="/docs",
-        redoc_url="/redoc",
-        openapi_url="/openapi.json",
+        # Interactive docs are served only in local development — on a deployed
+        # box these are disabled so the full API surface isn't published.
+        docs_url="/docs" if settings.expose_docs else None,
+        redoc_url="/redoc" if settings.expose_docs else None,
+        openapi_url="/openapi.json" if settings.expose_docs else None,
         lifespan=lifespan,
     )
 

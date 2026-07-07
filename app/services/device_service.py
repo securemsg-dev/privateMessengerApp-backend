@@ -9,7 +9,7 @@ Business logic for device registration and management.
 import logging
 from uuid import UUID
 
-from sqlalchemy import select
+from sqlalchemy import delete, select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.db.models.device import Device, DevicePlatform
@@ -32,6 +32,23 @@ async def register_device(
     existing: Optional[Device] = None
 
     if push_token:
+        # A push token identifies a PHYSICAL device. If another account still
+        # holds this token (previous user logged out / switched accounts on
+        # this phone), delete those rows — otherwise the previous account's
+        # notifications (sender name + private number) keep appearing on a
+        # phone that now belongs to someone else.
+        evicted = await db.execute(
+            delete(Device).where(
+                Device.push_token == push_token,
+                Device.user_id != user_id,
+            )
+        )
+        if evicted.rowcount:
+            logger.info(
+                "Reclaimed push token from %d device row(s) of other users",
+                evicted.rowcount,
+            )
+
         result = await db.execute(
             select(Device).where(
                 Device.user_id == user_id,
@@ -67,3 +84,21 @@ async def list_user_devices(user_id: UUID, db: AsyncSession) -> list[Device]:
         select(Device).where(Device.user_id == user_id).order_by(Device.created_at.desc())
     )
     return list(result.scalars().all())
+
+
+async def clear_push_token(user_id: UUID, push_token: str, db: AsyncSession) -> int:
+    """
+    Detach a push token from the caller's devices (logout flow). The device
+    rows stay (they hold the E2EE public key); only the token is nulled so
+    no further notifications reach a phone the user has signed out of.
+    Returns the number of rows updated.
+    """
+    result = await db.execute(
+        update(Device)
+        .where(Device.user_id == user_id, Device.push_token == push_token)
+        .values(push_token=None)
+    )
+    await db.flush()
+    if result.rowcount:
+        logger.info("Cleared push token on %d device(s) for user %s", result.rowcount, user_id)
+    return result.rowcount or 0
