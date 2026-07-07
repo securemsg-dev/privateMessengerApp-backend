@@ -151,6 +151,77 @@ async def _unread_counts_for(
     return {conv_id: int(count) for conv_id, count in rows}
 
 
+async def _last_messages_for(
+    db,
+    conversation_ids: list[UUID],
+) -> dict[UUID, MessageMetadata]:
+    """
+    One query for the newest message of EVERY conversation in the batch.
+    Uses a row_number() window (portable across Postgres and the SQLite test
+    DB) instead of one ORDER BY … LIMIT 1 query per conversation.
+    """
+    if not conversation_ids:
+        return {}
+    rn = (
+        func.row_number()
+        .over(
+            partition_by=MessageMetadata.conversation_id,
+            order_by=MessageMetadata.created_at.desc(),
+        )
+        .label("rn")
+    )
+    sub = (
+        select(MessageMetadata.id.label("mid"), rn)
+        .where(MessageMetadata.conversation_id.in_(conversation_ids))
+        .subquery()
+    )
+    rows = (await db.execute(
+        select(MessageMetadata)
+        .join(sub, MessageMetadata.id == sub.c.mid)
+        .where(sub.c.rn == 1)
+    )).scalars().all()
+    return {m.conversation_id: m for m in rows}
+
+
+async def _other_participants_for(
+    db,
+    conversation_ids: list[UUID],
+    current_user_id: UUID,
+) -> dict[UUID, User]:
+    """Batch version of _other_participant — one query for the whole chat list."""
+    if not conversation_ids:
+        return {}
+    rows = (await db.execute(
+        select(conversation_participants.c.conversation_id, User)
+        .join(User, conversation_participants.c.user_id == User.id)
+        .where(
+            conversation_participants.c.conversation_id.in_(conversation_ids),
+            User.id != current_user_id,
+        )
+    )).all()
+    out: dict[UUID, User] = {}
+    for conv_id, user in rows:
+        out.setdefault(conv_id, user)  # 1:1 conversations have exactly one other
+    return out
+
+
+async def _prefs_for(
+    db,
+    conversation_ids: list[UUID],
+    user_id: UUID,
+) -> dict[UUID, ConversationPref]:
+    """Batch-load the caller's prefs for every conversation in the list."""
+    if not conversation_ids:
+        return {}
+    rows = (await db.execute(
+        select(ConversationPref).where(
+            ConversationPref.user_id == user_id,
+            ConversationPref.conversation_id.in_(conversation_ids),
+        )
+    )).scalars().all()
+    return {p.conversation_id: p for p in rows}
+
+
 async def _hydrate_conversation(
     db,
     conv: Conversation,
@@ -287,17 +358,38 @@ async def list_conversations(
         .order_by(desc(Conversation.created_at))
     )
     convs = rows.scalars().all()
+    if not convs:
+        return []
+    conv_ids = [c.id for c in convs]
 
-    # Unread counts come from one grouped query; the remaining per-conversation
-    # lookups (last message / other participant / prefs) are fine for Phase A
-    # volumes — revisit with window functions when conversations-per-user grows.
-    unread_map = await _unread_counts_for(db, [c.id for c in convs], current_user.id)
-    out = [
-        await _hydrate_conversation(
-            db, c, current_user.id, unread=unread_map.get(c.id, 0),
+    # Everything is batched: 4 queries total for the whole list, regardless
+    # of how many conversations the user has. The previous per-conversation
+    # hydration paid 3 extra queries per row, which at WAN DB latency turned
+    # a 20-chat list into ~60 sequential round trips.
+    unread_map = await _unread_counts_for(db, conv_ids, current_user.id)
+    last_map = await _last_messages_for(db, conv_ids)
+    other_map = await _other_participants_for(db, conv_ids, current_user.id)
+    pref_map = await _prefs_for(db, conv_ids, current_user.id)
+
+    out: list[ConversationResponse] = []
+    for c in convs:
+        last_msg = last_map.get(c.id)
+        other = other_map.get(c.id)
+        pref = pref_map.get(c.id)
+        out.append(
+            ConversationResponse(
+                id=c.id,
+                is_group=c.is_group,
+                name=c.name,
+                created_at=c.created_at,
+                other_participant=UserPublic.model_validate(other) if other else None,
+                last_message=LastMessagePreview.model_validate(last_msg) if last_msg else None,
+                unread_count=unread_map.get(c.id, 0),
+                is_pinned=bool(pref and pref.is_pinned),
+                mute_until=pref.mute_until if pref else None,
+                manual_unread=bool(pref and pref.manual_unread),
+            )
         )
-        for c in convs
-    ]
 
     # Sort by last-message recency (falls back to conv.created_at when empty)
     out.sort(

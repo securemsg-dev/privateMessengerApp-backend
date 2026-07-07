@@ -33,7 +33,7 @@ class Session(UUIDPrimaryKeyMixin, TimestampMixin, Base):
         comment="bcrypt hash of the refresh token — never stored plaintext",
     )
     expires_at: Mapped[datetime] = mapped_column(
-        DateTime(timezone=True), nullable=False,
+        DateTime(timezone=True), nullable=False, index=True,
     )
 
     # ── Relationships ─────────────────────────────────────────────────────

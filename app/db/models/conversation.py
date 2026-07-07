@@ -12,7 +12,7 @@ Participants are tracked via ConversationParticipant (many-to-many).
 
 import uuid
 
-from sqlalchemy import Boolean, ForeignKey, String, Table, Column
+from sqlalchemy import Boolean, Column, ForeignKey, Index, String, Table
 from sqlalchemy.dialects.postgresql import UUID
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
@@ -35,6 +35,10 @@ conversation_participants = Table(
         ForeignKey("users.id", ondelete="CASCADE"),
         primary_key=True,
     ),
+    # The PK (conversation_id, user_id) can't serve "WHERE user_id = ?" —
+    # which is exactly how the chat list, call-signaling authorization, and
+    # message fan-out all query this table.
+    Index("ix_conversation_participants_user_id", "user_id"),
 )
 
 
