@@ -37,6 +37,10 @@ class User(UUIDPrimaryKeyMixin, TimestampMixin, Base):
         String(100), nullable=True,
         comment="Chosen during profile setup",
     )
+    bio: Mapped[Optional[str]] = mapped_column(
+        String(128), nullable=True,
+        comment="Short profile bio. Null when unset.",
+    )
     profile_picture_key: Mapped[Optional[str]] = mapped_column(
         String(512), nullable=True,
         comment="S3 object key — never a public URL",

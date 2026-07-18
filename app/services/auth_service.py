@@ -131,6 +131,53 @@ async def authenticate_or_delete_intent(
     raise ValueError("Invalid private number or password")
 
 
+async def change_login_password(
+    user: User,
+    current_password: str,
+    new_password: str,
+    keep_refresh_token: Optional[str],
+    db: AsyncSession,
+) -> None:
+    """
+    Change the user's LOGIN password (delete password is untouched).
+
+    Raises:
+        PermissionError — current_password does not match login_password_hash.
+            Endpoint should translate to HTTP 403.
+        ValueError — new password collides with the delete password. Without
+            this guard every future login with it would silently enter the
+            account-wipe branch (authenticate_or_delete_intent checks both
+            hashes). Endpoint should translate to HTTP 400 with a generic
+            message that does not confirm the collision.
+
+    Session handling: all of the user's sessions are deleted EXCEPT the one
+    matching `keep_refresh_token` (the caller's own), so other devices that
+    knew the old password are logged out on their next refresh. If the token
+    is None or unknown, every session is deleted — the caller then re-logins.
+    """
+    if not await verify_password_async(current_password, user.login_password_hash):
+        raise PermissionError("Current password is incorrect")
+
+    if await verify_password_async(new_password, user.delete_password_hash):
+        raise ValueError("Please choose a different password")
+
+    user.login_password_hash = await hash_password_async(new_password)
+
+    keep_hash = _hash_refresh_token(keep_refresh_token) if keep_refresh_token else None
+    result = await db.execute(
+        select(UserSession).where(UserSession.user_id == user.id)
+    )
+    for session in result.scalars().all():
+        if keep_hash is None or session.refresh_token_hash != keep_hash:
+            await db.delete(session)
+    await db.flush()
+    logger.info(
+        "Login password changed: user_id=%s private_number=******%s",
+        user.id,
+        user.private_number[-4:],
+    )
+
+
 async def delete_user_by_id(user_id: UUID, db: AsyncSession) -> None:
     """
     Hard-delete a user row by id. Trust is established by the caller having

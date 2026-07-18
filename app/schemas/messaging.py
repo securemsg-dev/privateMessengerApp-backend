@@ -30,6 +30,7 @@ class UserPublic(BaseModel):
     id: UUID
     private_number: str
     display_name: Optional[str]
+    bio: Optional[str] = None
     public_key: Optional[str]
     profile_picture_key: Optional[str] = None
 
@@ -37,8 +38,12 @@ class UserPublic(BaseModel):
 
 
 class ProfileUpdateRequest(BaseModel):
-    """Partial update body for PATCH /users/me. None = leave field unchanged."""
+    """Partial update body for PATCH /users/me. None = leave field unchanged.
+
+    `bio`: empty string clears the bio (stored as NULL); None leaves it as-is.
+    """
     display_name: Optional[str] = Field(None, max_length=100)
+    bio: Optional[str] = Field(None, max_length=128)
     profile_picture_key: Optional[str] = Field(None, max_length=512)
 
 

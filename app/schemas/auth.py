@@ -72,6 +72,22 @@ class LoginRequest(BaseModel):
         return validate_private_number(v)
 
 
+class ChangePasswordRequest(BaseModel):
+    """
+    Change the LOGIN password (the delete password cannot be changed here).
+    `refresh_token` identifies the caller's own session so it survives the
+    everything-else invalidation; omit it to invalidate all sessions.
+    """
+    current_password: str
+    new_password: str = Field(min_length=MIN_PASSWORD_LEN)
+    refresh_token: Optional[str] = None
+
+    @field_validator("new_password")
+    @classmethod
+    def _password_byte_limit(cls, v: str) -> str:
+        return validate_password_bytes(v)
+
+
 class ConfirmDeleteRequest(BaseModel):
     delete_token: str
 
