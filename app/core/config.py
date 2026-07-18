@@ -30,7 +30,7 @@ class Settings(BaseSettings):
 
     # ── App ──────────────────────────────────────────────────────────────
     APP_ENV: Literal["development", "staging", "production"] = "development"
-    APP_NAME: str = "Private Messenger"
+    APP_NAME: str = "Cricchat"
     DEBUG: bool = True
     # Master switch for the slowapi rate limiter. Keep True in production; set
     # False only to run authenticated load/stress tests from a single IP (which

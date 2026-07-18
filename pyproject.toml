@@ -5,7 +5,7 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "private-messenger-backend"
 version = "0.1.0"
-description = "Private Messenger App — FastAPI Backend"
+description = "Cricchat — FastAPI Backend"
 requires-python = ">=3.9"
 dependencies = [
     # Web framework

@@ -219,7 +219,7 @@ async def user_websocket_endpoint(
                     async with AsyncSessionLocal() as db:
                         caller = await db.get(User, user_id)
                         caller_name = (
-                            (caller.display_name or "PrivaChat") if caller else "PrivaChat"
+                            (caller.display_name or "Cricchat") if caller else "Cricchat"
                         )
                         caller_number = caller.private_number if caller else ""
                         # Identity must ride EVERY forwarded offer — a recipient

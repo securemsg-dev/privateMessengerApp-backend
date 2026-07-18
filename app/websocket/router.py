@@ -225,7 +225,7 @@ async def _notify_new_message(
                 return
 
             sender = await db.get(User, sender_id)
-            sender_name = (sender.display_name or "PrivaChat") if sender else "PrivaChat"
+            sender_name = (sender.display_name or "Cricchat") if sender else "Cricchat"
             sender_private_number = sender.private_number if sender else ""
 
             in_conversation = set(manager._conv_connections.get(conv_id_str, {}).keys())

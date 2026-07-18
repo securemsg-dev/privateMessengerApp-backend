@@ -107,9 +107,10 @@ def create_app() -> FastAPI:
     app = FastAPI(
         title=settings.APP_NAME,
         description=(
-            "Private Messenger Backend API — Phase 1\n\n"
-            "Provides authentication (OTP via SMS), device registration, "
-            "and real-time messaging via WebSocket with Redis pub/sub."
+            "Cricchat Backend API\n\n"
+            "Provides authentication (private number + password), device "
+            "registration, and real-time messaging via WebSocket with Redis "
+            "pub/sub."
         ),
         version="1.0.0",
         # Interactive docs are served only in local development — on a deployed
