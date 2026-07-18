@@ -22,6 +22,7 @@ import pytest
 from sqlalchemy import insert, select
 from sqlalchemy.ext.asyncio import AsyncSession
 from starlette.testclient import TestClient
+from starlette.websockets import WebSocketDisconnect
 
 from app.core.security import create_access_token, hash_password
 from app.db.models.conversation import Conversation, conversation_participants
@@ -164,23 +165,30 @@ async def test_ws_no_token(ws_client):
             pass
 
 
+def _assert_closed_1008(ws) -> None:
+    """The server accepts then closes with 1008 so the client can see the
+    policy-violation code (a pre-accept rejection surfaces as a generic 1006
+    and the app's token-refresh reconnect path would never fire)."""
+    with pytest.raises(WebSocketDisconnect) as exc_info:
+        ws.receive_text()
+    assert exc_info.value.code == 1008
+
+
 @pytest.mark.asyncio
 async def test_ws_invalid_token(ws_client):
-    """Connecting with an invalid JWT should disconnect with 1008."""
+    """Connecting with an invalid JWT should close with 1008."""
     conv_id = uuid.uuid4()
-    with pytest.raises(Exception):
-        with ws_client.websocket_connect(f"/ws/{conv_id}?token=garbage"):
-            pass
+    with ws_client.websocket_connect(f"/ws/{conv_id}?token=garbage") as ws:
+        _assert_closed_1008(ws)
 
 
 @pytest.mark.asyncio
 async def test_ws_expired_token(ws_client):
-    """Connecting with an expired JWT should disconnect."""
+    """Connecting with an expired JWT should close with 1008."""
     conv_id = uuid.uuid4()
     expired = forge_expired_token(uuid.uuid4())
-    with pytest.raises(Exception):
-        with ws_client.websocket_connect(f"/ws/{conv_id}?token={expired}"):
-            pass
+    with ws_client.websocket_connect(f"/ws/{conv_id}?token={expired}") as ws:
+        _assert_closed_1008(ws)
 
 
 # ── WS Authorization ─────────────────────────────────────────────────────────
@@ -193,21 +201,19 @@ async def test_ws_user_not_participant(ws_client):
     _, conv_id = await _setup_user_and_conversation("+60300000002")
 
     token = create_access_token(user_a_id)
-    with pytest.raises(Exception):
-        with ws_client.websocket_connect(f"/ws/{conv_id}?token={token}"):
-            pass
+    with ws_client.websocket_connect(f"/ws/{conv_id}?token={token}") as ws:
+        _assert_closed_1008(ws)
 
 
 @pytest.mark.asyncio
 async def test_ws_nonexistent_conversation(ws_client):
-    """Connecting to a non-existent conversation should disconnect."""
+    """Connecting to a non-existent conversation should close with 1008."""
     user_id = await _setup_user_only("+60300000003")
     token = create_access_token(user_id)
     fake_conv_id = uuid.uuid4()
 
-    with pytest.raises(Exception):
-        with ws_client.websocket_connect(f"/ws/{fake_conv_id}?token={token}"):
-            pass
+    with ws_client.websocket_connect(f"/ws/{fake_conv_id}?token={token}") as ws:
+        _assert_closed_1008(ws)
 
 
 @pytest.mark.asyncio
@@ -247,10 +253,9 @@ async def test_user_ws_connect_success(ws_client):
 
 @pytest.mark.asyncio
 async def test_user_ws_invalid_token_rejected(ws_client):
-    """A bad token on /ws/user must be rejected, not accepted."""
-    with pytest.raises(Exception):
-        with ws_client.websocket_connect("/ws/user?token=garbage"):
-            pass
+    """A bad token on /ws/user must be closed with 1008."""
+    with ws_client.websocket_connect("/ws/user?token=garbage") as ws:
+        _assert_closed_1008(ws)
 
 
 @pytest.mark.asyncio
@@ -467,6 +472,51 @@ async def test_ws_full_message_flow_two_users(ws_client):
         )).scalar_one()
         assert msg.delivered_at is not None
         assert msg.read_at is not None
+
+
+@pytest.mark.asyncio
+async def test_ws_batched_read_receipts(ws_client):
+    """B acks several messages in ONE `read` frame; A gets one event with all
+    the ids and every row is persisted as read. (Batching keeps a chat-open
+    burst under the per-connection throttle.)"""
+    user_a_id, conv_id = await _setup_user_and_conversation(
+        "+60300000012", extra_identifier="+60300000013",
+    )
+    user_b_id = await _user_id_by_identifier("+60300000013")
+
+    token_a = create_access_token(user_a_id)
+    token_b = create_access_token(user_b_id)
+
+    with ws_client.websocket_connect(f"/ws/{conv_id}?token={token_a}") as ws_a, \
+         ws_client.websocket_connect(f"/ws/{conv_id}?token={token_b}") as ws_b:
+
+        msg_ids: list[str] = []
+        for i in range(3):
+            ws_a.send_text(json.dumps({
+                "type": "message",
+                "encrypted_payload": f"cipher-{i}",
+                "message_type": "text",
+            }))
+            evt_b = json.loads(ws_b.receive_text())
+            assert evt_b["type"] == "message"
+            msg_ids.append(evt_b["message_id"])
+            # Drain A's own echo so the receipt below is A's next frame.
+            echo_a = json.loads(ws_a.receive_text())
+            assert echo_a["type"] == "message"
+
+        ws_b.send_text(json.dumps({"type": "read", "message_ids": msg_ids}))
+        receipt = json.loads(ws_a.receive_text())
+        assert receipt["type"] == "read"
+        assert set(receipt["message_ids"]) == set(msg_ids)
+        assert receipt["by_user_id"] == str(user_b_id)
+
+    async with TestSessionLocal() as session:
+        for mid in msg_ids:
+            msg = (await session.execute(
+                select(MessageMetadata).where(MessageMetadata.id == uuid.UUID(mid))
+            )).scalar_one()
+            assert msg.read_at is not None
+            assert msg.delivered_at is not None
 
 
 # ── Real-time spine: live message_notification over the user channel ───────────

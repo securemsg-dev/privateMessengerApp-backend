@@ -344,6 +344,12 @@ async def _handle_reaction(
     await manager.publish(redis, conv_id_str, event)
 
 
+# Upper bound on ids per receipt frame. Matches the max message page size, so
+# one frame can ack a whole freshly-loaded page. ~200 UUIDs ≈ 8 KB of JSON,
+# comfortably under WS_MAX_FRAME_BYTES.
+MAX_RECEIPT_BATCH = 200
+
+
 async def _handle_receipt(
     websocket: WebSocket,
     redis: aioredis.Redis,
@@ -354,10 +360,27 @@ async def _handle_receipt(
     kind: str,  # "delivery" | "read"
     data: dict,
 ) -> None:
-    """Mark a message delivered/read and notify peers via Redis."""
-    raw_id = data.get("message_id", "")
+    """Mark one or more messages delivered/read and notify peers via Redis.
+
+    Accepts either `message_id` (single) or `message_ids` (batch). Batching
+    matters: opening a chat with N unread messages must cost one frame, not N —
+    per-message frames blow through the per-connection throttle and the
+    dropped receipts leave the sender's ticks and unread counts stale forever.
+    """
+    raw_ids = data.get("message_ids")
+    if raw_ids is None:
+        raw_ids = [data.get("message_id", "")]
+    if (
+        not isinstance(raw_ids, list)
+        or not raw_ids
+        or len(raw_ids) > MAX_RECEIPT_BATCH
+    ):
+        await websocket.send_text(
+            json.dumps({"type": "error", "detail": "Invalid message_ids"})
+        )
+        return
     try:
-        message_id = UUID(raw_id)
+        message_ids = [UUID(str(r)) for r in raw_ids]
     except (ValueError, TypeError):
         await websocket.send_text(
             json.dumps({"type": "error", "detail": "Invalid message_id"})
@@ -369,38 +392,41 @@ async def _handle_receipt(
         # messages is silently ignored (no DB write, no publish).
         result = await db.execute(
             select(MessageMetadata).where(
-                MessageMetadata.id == message_id,
+                MessageMetadata.id.in_(message_ids),
                 MessageMetadata.conversation_id == conversation_id,
                 MessageMetadata.sender_id != user_id,
             )
         )
-        msg = result.scalar_one_or_none()
-        if not msg:
-            return
+        msgs = result.scalars().all()
 
         now = datetime.now(timezone.utc)
-        changed = False
-
-        if kind == "delivery" and msg.delivered_at is None:
-            msg.delivered_at = now
-            changed = True
-        elif kind == "read":
-            # `read` implies `delivered` — set both atomically
-            if msg.delivered_at is None:
+        changed_ids: list[UUID] = []
+        for msg in msgs:
+            changed = False
+            if kind == "delivery" and msg.delivered_at is None:
                 msg.delivered_at = now
                 changed = True
-            if msg.read_at is None:
-                msg.read_at = now
-                changed = True
+            elif kind == "read":
+                # `read` implies `delivered` — set both atomically
+                if msg.delivered_at is None:
+                    msg.delivered_at = now
+                    changed = True
+                if msg.read_at is None:
+                    msg.read_at = now
+                    changed = True
+            if changed:
+                changed_ids.append(msg.id)
 
-        if not changed:
+        if not changed_ids:
             return  # already in this state — don't re-broadcast
         await db.commit()
 
     event = {
         "type": kind,
         "conversation_id": conv_id_str,
-        "message_id": str(message_id),
+        # Legacy single-id field (first changed id) + the full batch.
+        "message_id": str(changed_ids[0]),
+        "message_ids": [str(i) for i in changed_ids],
         "by_user_id": user_id_str,
         "timestamp": datetime.now(timezone.utc).isoformat(),
     }
@@ -419,8 +445,17 @@ async def websocket_endpoint(
     Per-conversation WebSocket. Inbound frames are dispatched on the top-level
     `type` field — see module docstring for the wire format.
     """
-    user_id = await _authenticate_websocket(token)
-    await _authorize_conversation(user_id, conversation_id)
+    try:
+        user_id = await _authenticate_websocket(token)
+        await _authorize_conversation(user_id, conversation_id)
+    except WebSocketDisconnect:
+        # A close code can only reach the client AFTER the handshake is
+        # accepted. Rejecting pre-accept surfaces on the client as a generic
+        # 1006, so its "1008 → refresh token → reconnect" path never fires
+        # and an expired-token socket just flaps on backoff.
+        await websocket.accept()
+        await websocket.close(code=status.WS_1008_POLICY_VIOLATION)
+        return
 
     conv_id_str = str(conversation_id)
     user_id_str = str(user_id)

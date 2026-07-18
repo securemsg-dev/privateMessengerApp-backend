@@ -122,7 +122,14 @@ async def user_websocket_endpoint(
     websocket: WebSocket,
     token: str = Query(..., description="JWT access token"),
 ) -> None:
-    user_id = await _authenticate(token)
+    try:
+        user_id = await _authenticate(token)
+    except WebSocketDisconnect:
+        # Accept-then-close so the 1008 code actually reaches the client —
+        # see the matching comment in websocket/router.py.
+        await websocket.accept()
+        await websocket.close(code=status.WS_1008_POLICY_VIOLATION)
+        return
     user_id_str = str(user_id)
 
     redis: aioredis.Redis = websocket.app.state.redis
