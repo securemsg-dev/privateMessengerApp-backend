@@ -39,6 +39,10 @@ class Settings(BaseSettings):
     # False only to run authenticated load/stress tests from a single IP (which
     # the per-IP limits would otherwise throttle). Re-enable immediately after.
     RATE_LIMITING_ENABLED: bool = True
+    # Shown on the public /delete-account page as the fallback channel for
+    # users who can no longer sign in. Google Play requires a reachable
+    # contact there, so this must be a monitored inbox in production.
+    SUPPORT_EMAIL: str = "support@cricchat.app"
 
     # ── Database ─────────────────────────────────────────────────────────
     DATABASE_URL: str = "postgresql+asyncpg://postgres:postgres@localhost:5432/private_messenger"

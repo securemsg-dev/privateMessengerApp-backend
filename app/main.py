@@ -29,7 +29,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from slowapi import _rate_limit_exceeded_handler
 from slowapi.errors import RateLimitExceeded
 
-from app.api.v1.endpoints import health
+from app.api.v1.endpoints import account_deletion, health
 from app.api.v1.router import api_router
 from app.core.config import settings
 from app.core.limiter import limiter
@@ -136,6 +136,9 @@ def create_app() -> FastAPI:
 
     # ── Routes ────────────────────────────────────────────────────────────
     app.include_router(health.router)  # /health at root
+    # /delete-account at root — must be publicly reachable in a browser for
+    # the Google Play Data safety declaration.
+    app.include_router(account_deletion.router)
     app.include_router(api_router, prefix="/api/v1")
     # ORDER MATTERS: the static /ws/user route MUST be registered before the
     # parametrized /ws/{conversation_id} route. Starlette matches in
