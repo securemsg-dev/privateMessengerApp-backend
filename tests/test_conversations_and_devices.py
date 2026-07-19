@@ -207,3 +207,33 @@ async def test_clear_push_token(client: AsyncClient):
         headers=auth_header(user["tokens"]["access_token"]),
     )
     assert resp2.status_code == 204
+
+
+async def test_create_conversation_race_returns_winner(client, db_session):
+    """If the unique direct_key insert collides (concurrent create from both
+    sides), the endpoint returns the already-created conversation instead of
+    erroring or duplicating."""
+    from app.db.models.conversation import Conversation
+
+    alice = await register_and_login(client)
+    bob = await register_and_login(client)
+    alice_id = uuid.UUID(alice["user"]["id"])
+    bob_id = uuid.UUID(bob["user"]["id"])
+
+    # Simulate the race winner: a keyed conversation row that the existence
+    # check can't find (no participant rows — mimics the loser's view mid-race).
+    # Everything is COMMITTED, as the winner's transaction would be in
+    # production — the endpoint's rollback must only undo the loser's insert.
+    direct_key = ":".join(sorted((str(alice_id), str(bob_id))))
+    winner = Conversation(is_group=False, name=None, direct_key=direct_key)
+    db_session.add(winner)
+    await db_session.commit()
+    winner_id = str(winner.id)
+
+    resp = await client.post(
+        "/api/v1/conversations",
+        json={"other_private_number": bob["private_number"]},
+        headers=auth_header(alice["tokens"]["access_token"]),
+    )
+    assert resp.status_code in (200, 201), resp.text
+    assert resp.json()["id"] == winner_id

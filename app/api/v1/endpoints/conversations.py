@@ -25,6 +25,7 @@ from uuid import UUID
 
 from fastapi import APIRouter, HTTPException, Query, Request, status
 from sqlalchemy import select, func, desc
+from sqlalchemy.exc import IntegrityError
 
 from app.core.dependencies import CurrentUser, DBSession
 from app.core.limiter import limiter
@@ -319,10 +320,24 @@ async def create_or_get_conversation(
     if existing:
         return await _hydrate_conversation(db, existing, current_user.id)
 
-    # 3. Create a new 1:1 conversation + add both participants
-    conv = Conversation(is_group=False, name=None)
+    # 3. Create a new 1:1 conversation + add both participants. The unique
+    # direct_key closes the race where both users create "the conversation
+    # with each other" simultaneously and each passes the check above — the
+    # loser's INSERT fails and we return the winner's row instead.
+    # Captured before the flush: a rollback expires ORM objects, and touching
+    # current_user afterwards would lazy-load outside the async greenlet.
+    caller_id = current_user.id
+    direct_key = ":".join(sorted((str(caller_id), str(other.id))))
+    conv = Conversation(is_group=False, name=None, direct_key=direct_key)
     db.add(conv)
-    await db.flush()  # assign conv.id
+    try:
+        await db.flush()  # assign conv.id; unique violation surfaces here
+    except IntegrityError:
+        await db.rollback()
+        winner = (await db.execute(
+            select(Conversation).where(Conversation.direct_key == direct_key)
+        )).scalar_one()
+        return await _hydrate_conversation(db, winner, caller_id)
 
     await db.execute(
         conversation_participants.insert().values(

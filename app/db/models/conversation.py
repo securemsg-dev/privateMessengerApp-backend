@@ -53,6 +53,12 @@ class Conversation(UUIDPrimaryKeyMixin, TimestampMixin, Base):
         String(200), nullable=True,
         comment="Group name — null for 1-to-1 conversations",
     )
+    direct_key: Mapped[Optional[str]] = mapped_column(
+        String(80), nullable=True, unique=True, index=True,
+        comment='Sorted "uuid:uuid" of the two participants for 1:1 chats. '
+                "The unique constraint closes the concurrent-create race. "
+                "Null for groups (and legacy duplicate rows).",
+    )
 
     # ── Relationships ─────────────────────────────────────────────────────
     participants: Mapped[list["User"]] = relationship(  # noqa: F821
