@@ -31,7 +31,10 @@ class Settings(BaseSettings):
     # ── App ──────────────────────────────────────────────────────────────
     APP_ENV: Literal["development", "staging", "production"] = "development"
     APP_NAME: str = "Cricchat"
-    DEBUG: bool = True
+    # None = derive from APP_ENV (development → True). An explicit DEBUG env
+    # var still wins — but a deployed box that forgets to set it must never
+    # default to SQL echo + debug behaviour.
+    DEBUG: Optional[bool] = None
     # Master switch for the slowapi rate limiter. Keep True in production; set
     # False only to run authenticated load/stress tests from a single IP (which
     # the per-IP limits would otherwise throttle). Re-enable immediately after.
@@ -128,6 +131,12 @@ class Settings(BaseSettings):
         # affordance but leak the full API surface. Only serve them in local
         # development; never on a deployed (staging/production) box.
         return self.APP_ENV == "development"
+
+    @model_validator(mode="after")
+    def _default_debug_from_env(self) -> "Settings":
+        if self.DEBUG is None:
+            self.DEBUG = self.APP_ENV == "development"
+        return self
 
     @model_validator(mode="after")
     def _require_real_secrets(self) -> "Settings":

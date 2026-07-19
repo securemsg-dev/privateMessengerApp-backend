@@ -113,7 +113,12 @@ async def _share_a_conversation(user_a: UUID, user_b: UUID) -> bool:
             )
         )
         verdict = bool(result.scalar())
-    _share_cache_put(user_a, user_b, verdict)
+    # Only cache positive verdicts: a negative cached right before the pair's
+    # first conversation is created (add contact → immediately call) would
+    # silently drop their signaling for the TTL. Negative lookups are rare
+    # (unauthorized frames), so skipping the cache there costs little.
+    if verdict:
+        _share_cache_put(user_a, user_b, verdict)
     return verdict
 
 
