@@ -63,6 +63,15 @@ class MessageMetadata(UUIDPrimaryKeyMixin, TimestampMixin, Base):
         index=True,
         comment="Inline reply target (Phase C.2). Null = standalone message.",
     )
+    media_blob_id: Mapped[Optional[uuid.UUID]] = mapped_column(
+        UUID(as_uuid=True),
+        ForeignKey("media_blobs.id", ondelete="SET NULL"),
+        nullable=True,
+        index=True,
+        comment="Blob carried by this media message. Used only for storage "
+                "lifecycle (delete-for-everyone / account delete / orphan "
+                "sweep) — the content itself stays E2EE.",
+    )
     deleted_at: Mapped[Optional[datetime]] = mapped_column(
         DateTime(timezone=True),
         nullable=True,

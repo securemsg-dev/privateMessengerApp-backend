@@ -51,6 +51,7 @@ from sqlalchemy import select
 from app.core.config import settings
 from app.core.security import verify_access_token
 from app.db.models.conversation import conversation_participants
+from app.db.models.media_blob import MediaBlob
 from app.db.models.message import MessageMetadata, MessageType
 from app.db.models.message_reaction import MessageReaction
 from app.db.models.user import User
@@ -134,6 +135,20 @@ async def _handle_message(
             )
             return
 
+    # Optional plaintext blob reference for media messages — enables storage
+    # lifecycle cleanup (the blob id inside the E2EE payload is unreadable
+    # server-side). Old clients simply omit it.
+    raw_media_blob = data.get("media_blob_id")
+    media_blob_id: Optional[UUID] = None
+    if raw_media_blob:
+        try:
+            media_blob_id = UUID(raw_media_blob)
+        except (ValueError, TypeError):
+            await websocket.send_text(
+                json.dumps({"type": "error", "detail": "Invalid media_blob_id"})
+            )
+            return
+
     try:
         msg_type = MessageType(message_type_str)
     except ValueError:
@@ -158,6 +173,23 @@ async def _handle_message(
                 )
                 return
 
+        # Blob reference must belong to the sender and have its bytes uploaded
+        # — stops a client from attaching (and later cascading deletion onto)
+        # someone else's blob.
+        if media_blob_id is not None:
+            blob = (await db.execute(
+                select(MediaBlob).where(
+                    MediaBlob.id == media_blob_id,
+                    MediaBlob.owner_id == user_id,
+                    MediaBlob.uploaded_at.is_not(None),
+                )
+            )).scalar_one_or_none()
+            if blob is None:
+                await websocket.send_text(
+                    json.dumps({"type": "error", "detail": "media_blob_id not found"})
+                )
+                return
+
         msg = MessageMetadata(
             conversation_id=conversation_id,
             sender_id=user_id,
@@ -165,6 +197,7 @@ async def _handle_message(
             encrypted_payload=encrypted_payload,
             self_destruct=self_destruct,
             reply_to_id=reply_to_id,
+            media_blob_id=media_blob_id,
         )
         db.add(msg)
         await db.commit()

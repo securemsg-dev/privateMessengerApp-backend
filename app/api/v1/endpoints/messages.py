@@ -22,9 +22,11 @@ from app.core.dependencies import CurrentUser, DBSession
 from app.core.limiter import limiter
 from app.db.models.conversation import conversation_participants
 from app.db.models.deleted_message import DeletedMessage
+from app.db.models.media_blob import MediaBlob
 from app.db.models.message import MessageMetadata
 from app.db.models.starred_message import StarredMessage
 from app.schemas.messaging import DeleteMessageRequest, StarMessageRequest
+from app.services.media_storage import get_storage
 from app.websocket.manager import manager
 
 # How long after sending a message you can still wipe it for everyone.
@@ -157,6 +159,19 @@ async def delete_message(
     msg.deleted_at = now
     msg.deleted_by = current_user.id
     msg.encrypted_payload = ""  # wipe so even DB dumps don't expose ciphertext
+
+    # Media message: remove the ciphertext file + blob row too — otherwise the
+    # bytes outlive the message forever on the storage volume.
+    if msg.media_blob_id is not None:
+        blob = (await db.execute(
+            select(MediaBlob).where(MediaBlob.id == msg.media_blob_id)
+        )).scalar_one_or_none()
+        # Cleared explicitly (not left to FK SET NULL) so the tombstone row is
+        # fully wiped on every backend, SQLite included.
+        msg.media_blob_id = None
+        if blob is not None:
+            await get_storage().delete_bytes(blob.id)
+            await db.delete(blob)
     await db.flush()
 
     # Broadcast tombstone to every connected client in this conversation.

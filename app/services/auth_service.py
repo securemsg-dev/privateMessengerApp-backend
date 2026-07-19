@@ -25,9 +25,11 @@ from app.core.security import (
     hash_password_async,
     verify_password_async,
 )
+from app.db.models.media_blob import MediaBlob
 from app.db.models.session import Session as UserSession
 from app.db.models.user import User
 from app.schemas.auth import TokenPair
+from app.services.media_storage import get_storage
 
 logger = logging.getLogger(__name__)
 
@@ -198,6 +200,22 @@ async def delete_user_by_id(user_id: UUID, db: AsyncSession) -> None:
         user.id,
         user.private_number[-4:],
     )
+
+    # Media cleanup: media_blobs.owner_id is only SET NULL by the FK, so
+    # without this the ciphertext files (avatar + every sent attachment)
+    # would sit on the storage volume forever. File deletion is best-effort
+    # — a storage hiccup must not block the account wipe.
+    storage = get_storage()
+    owned_blobs = (await db.execute(
+        select(MediaBlob).where(MediaBlob.owner_id == user_id)
+    )).scalars().all()
+    for blob in owned_blobs:
+        try:
+            await storage.delete_bytes(blob.id)
+        except Exception:
+            logger.warning("Account delete: failed to remove blob file %s", blob.id)
+        await db.delete(blob)
+
     await db.delete(user)
     await db.flush()
 
