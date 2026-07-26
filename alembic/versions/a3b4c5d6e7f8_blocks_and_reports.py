@@ -21,6 +21,7 @@ from typing import Sequence, Union
 
 from alembic import op
 import sqlalchemy as sa
+from sqlalchemy.dialects import postgresql
 
 
 revision: str = 'a3b4c5d6e7f8'
@@ -29,14 +30,18 @@ branch_labels: Union[str, Sequence[str], None] = None
 depends_on: Union[str, Sequence[str], None] = None
 
 
-report_reason = sa.Enum(
+# create_type=False: these types are created/dropped ONLY by the explicit
+# .create()/.drop() calls below (idempotent via checkfirst). Without this,
+# op.create_table would emit a second CREATE TYPE for the same enum and
+# Postgres would abort with "type already exists".
+report_reason = postgresql.ENUM(
     'spam', 'harassment', 'hate_speech', 'sexual_content', 'violence',
     'child_safety', 'impersonation', 'other',
-    name='reportreason',
+    name='reportreason', create_type=False,
 )
-report_status = sa.Enum(
+report_status = postgresql.ENUM(
     'pending', 'reviewing', 'actioned', 'dismissed',
-    name='reportstatus',
+    name='reportstatus', create_type=False,
 )
 
 
