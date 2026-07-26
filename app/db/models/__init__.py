@@ -7,6 +7,7 @@ Import all models here so that Alembic's env.py can discover them
 when running `alembic revision --autogenerate`.
 """
 
+from app.db.models.blocked_user import BlockedUser
 from app.db.models.call import Call
 from app.db.models.contact import Contact
 from app.db.models.conversation import Conversation, conversation_participants
@@ -19,6 +20,7 @@ from app.db.models.message_reaction import MessageReaction
 from app.db.models.session import Session
 from app.db.models.starred_message import StarredMessage
 from app.db.models.user import User
+from app.db.models.user_report import ReportReason, ReportStatus, UserReport
 
 __all__ = [
     "User",
@@ -34,4 +36,8 @@ __all__ = [
     "StarredMessage",
     "DeletedMessage",
     "Call",
+    "BlockedUser",
+    "UserReport",
+    "ReportReason",
+    "ReportStatus",
 ]

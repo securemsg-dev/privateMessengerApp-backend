@@ -136,8 +136,9 @@ def create_app() -> FastAPI:
 
     # ── Routes ────────────────────────────────────────────────────────────
     app.include_router(health.router)  # /health at root
-    # /privacy and /delete-account at root — both must be publicly reachable
-    # in a browser for the Play Store listing and Data safety declarations.
+    # /privacy, /delete-account and /report-abuse at root — all three must be
+    # publicly reachable in a browser for the Play Store listing, the Data
+    # safety declaration, and the User Generated Content policy respectively.
     app.include_router(legal.router)
     app.include_router(api_router, prefix="/api/v1")
     # ORDER MATTERS: the static /ws/user route MUST be registered before the

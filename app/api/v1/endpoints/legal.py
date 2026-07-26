@@ -7,6 +7,7 @@ Public, unauthenticated legal pages served at the domain root:
 
   • /privacy         — privacy policy (required by the Play Store listing)
   • /delete-account  — account deletion instructions (required by Data safety)
+  • /report-abuse    — abuse reporting + blocking (required by the UGC policy)
 
 Both must be reachable in a plain browser WITHOUT installing the app; Google
 reviewers open them directly, so they cannot live behind auth or a deep link.
@@ -190,7 +191,8 @@ def _privacy_body() -> str:
     <li>No phone number, email address, or real name is required to register.</li>
     <li>No access to your device's contacts, address book, or location.</li>
     <li>No analytics, advertising, tracking, or profiling SDKs of any kind.</li>
-    <li>No readable message content, media, or call audio — see below.</li>
+    <li>No readable message content, media, or call audio — with one narrow
+        exception you control, described under <em>Abuse reports</em> below.</li>
   </ul>
 
   <h2>End-to-end encryption</h2>
@@ -206,6 +208,33 @@ def _privacy_body() -> str:
   <p>
     Push notifications never contain message content. They tell your device
     that something arrived; the app decrypts it locally.
+  </p>
+
+  <h2>Abuse reports</h2>
+  <p>
+    There is exactly one way message content can become readable to us, and
+    only you can trigger it. When you report someone, you may choose to attach
+    the messages you are reporting. If you tick <strong>Include recent
+    messages</strong>, your device decrypts those specific messages and sends
+    copies to our moderation team, where they are stored in readable form so a
+    human can assess the report.
+  </p>
+  <ul>
+    <li>This is off by default and always requires an explicit confirmation.</li>
+    <li>Only the messages you select are attached — never your wider history,
+        and never anything from your other conversations.</li>
+    <li>If you decline, the report is still filed and reviewed using the reason
+        and description you provide.</li>
+    <li>Attached content is used solely to assess that report and enforce our
+        rules. It is retained with the report record and is not used for any
+        other purpose.</li>
+    <li>We also store who reported whom, and when, so we can act on repeat
+        offenders. The reported person is never told who reported them.</li>
+  </ul>
+  <p>
+    Blocking someone involves no content at all — we record only that you
+    blocked them. See <a href="/report-abuse">reporting abuse</a> for how both
+    features work.
   </p>
 
   <h2>Permissions the app requests</h2>
@@ -243,6 +272,9 @@ def _privacy_body() -> str:
         immediate and permanent.</li>
     <li><strong>Edit or remove</strong> your display name, bio, and profile picture in the app at any time.</li>
     <li><strong>Change your passwords</strong> in the app at any time.</li>
+    <li><strong>Block or report</strong> anyone who contacts you — see
+        <a href="/report-abuse">reporting abuse</a>. Blocking is immediate and
+        the other person is not notified.</li>
     <li>Depending on where you live, you may have additional rights to access,
         correct, or export your data. Contact us and we will help — though note
         that we cannot produce message content, because we cannot decrypt it.</li>
@@ -356,6 +388,88 @@ def _delete_body() -> str:
 """
 
 
+# ── Abuse reporting ───────────────────────────────────────────────────────────
+# Google Play's User Generated Content policy asks for a reporting channel that
+# works WITHOUT the app installed — a reviewer, or someone who has already
+# uninstalled, must still be able to reach us. The in-app flow (Report on any
+# chat or message) is the primary path; this page is the public fallback and
+# the place where the response-time commitment is published.
+
+def _report_abuse_body() -> str:
+    app = APP_DISPLAY_NAME
+    email = settings.ABUSE_EMAIL or settings.SUPPORT_EMAIL
+    hours = settings.ABUSE_RESPONSE_HOURS
+    return f"""
+  <h1>Report abuse on {app}</h1>
+  <p class="lede">
+    {app} does not tolerate harassment, spam, hate speech, sexual content
+    involving minors, threats of violence, or impersonation. Reports are
+    reviewed by a human and acted on within {hours} hours.
+  </p>
+
+  <h2>Reporting from inside the app</h2>
+  <p>This is the fastest route, and the only one that can attach evidence.</p>
+  <ol>
+    <li>Open the conversation with the person you want to report.</li>
+    <li>Tap the <strong>⋮</strong> menu in the top-right corner.</li>
+    <li>Tap <strong>Report</strong>, choose a reason, and add any context.</li>
+    <li>Optionally tick <strong>Include recent messages</strong> so our
+        moderators can see what was actually sent.</li>
+  </ol>
+  <p>
+    You can also long-press any single message and tap <strong>Report</strong>
+    to report just that message.
+  </p>
+
+  <div class="card">
+    <p style="margin:.25rem 0;">
+      <strong>{app} is end-to-end encrypted.</strong> We cannot read your
+      messages, so we cannot see reported content unless you choose to attach
+      it. Ticking <em>Include recent messages</em> sends copies of those
+      specific messages to our moderation team unencrypted — nothing else in
+      your account becomes readable, and reports without attachments are still
+      reviewed on the reason and description you give.
+    </p>
+  </div>
+
+  <h2>Blocking someone</h2>
+  <p>
+    Blocking is separate from reporting and takes effect immediately. Open the
+    conversation, tap <strong>⋮</strong>, then <strong>Block</strong>. Their
+    messages and calls stop reaching you, and they are not told they have been
+    blocked. Manage your list under
+    <strong>Settings → Blocked users</strong>.
+  </p>
+
+  <h2>Reporting without the app</h2>
+  <p>
+    If you have uninstalled {app}, cannot sign in, or are reporting on behalf
+    of someone else, email
+    <a href="mailto:{email}?subject=Cricchat%20abuse%20report">{email}</a>.
+    Please include:
+  </p>
+  <ul>
+    <li>The 10-digit private number of the account you are reporting.</li>
+    <li>What happened, and roughly when.</li>
+    <li>Screenshots, if you have them.</li>
+  </ul>
+
+  <h2>What we do with a report</h2>
+  <ul>
+    <li>Every report is reviewed by a person within {hours} hours.</li>
+    <li>Depending on severity we warn, suspend, or permanently remove the
+        reported account.</li>
+    <li>Reports involving child safety or credible threats of violence are
+        prioritised and may be referred to law enforcement.</li>
+    <li>The reported account is never told who reported it.</li>
+  </ul>
+
+  <p>See also our <a href="/privacy">Privacy Policy</a>.</p>
+
+  <footer>{app} — abuse reporting policy. Last updated {LAST_UPDATED}.</footer>
+"""
+
+
 # ── Routes ────────────────────────────────────────────────────────────────────
 
 @router.get(
@@ -383,4 +497,18 @@ async def delete_account_page() -> HTMLResponse:
     """Public deletion-instructions page. No auth, no side effects."""
     return HTMLResponse(
         content=_shell(f"Delete your {APP_DISPLAY_NAME} account", _delete_body())
+    )
+
+
+@router.get(
+    "/report-abuse",
+    response_class=HTMLResponse,
+    include_in_schema=False,
+    summary="Public abuse-reporting instructions (Play UGC policy requirement)",
+    tags=["Legal"],
+)
+async def report_abuse_page() -> HTMLResponse:
+    """Public abuse-reporting page. No auth, no side effects."""
+    return HTMLResponse(
+        content=_shell(f"Report abuse on {APP_DISPLAY_NAME}", _report_abuse_body())
     )

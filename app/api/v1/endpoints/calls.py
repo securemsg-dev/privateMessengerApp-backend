@@ -24,6 +24,7 @@ from app.core.limiter import limiter
 from app.db.models.call import Call
 from app.db.models.conversation import conversation_participants
 from app.db.models.user import User
+from app.services.moderation_service import blocks_exist_between
 from app.schemas.messaging import (
     CallCreateRequest,
     CallResponse,
@@ -67,6 +68,15 @@ async def create_call(
         raise HTTPException(
             status_code=status.HTTP_403_FORBIDDEN,
             detail="Both parties must be in the conversation",
+        )
+
+    # A block either way means no call. Signaling is refused independently in
+    # websocket/user_router.py; refusing here too stops a phantom "calling…"
+    # row appearing in both parties' history for a call that can never connect.
+    if await blocks_exist_between(db, current_user.id, body.callee_id):
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="This user is unavailable",
         )
 
     call = Call(

@@ -146,11 +146,31 @@ class ConnectionManager:
         conversation_id: str,
         data: str,
     ) -> None:
-        """Send `data` to all WebSockets in this conversation on THIS instance."""
+        """
+        Send `data` to all WebSockets in this conversation on THIS instance.
+
+        Honours the server-internal `_skip_user_ids` routing hint: members who
+        have blocked the sender are skipped, and the hint is stripped so it
+        never reaches a client. Used for group chats where only *some* members
+        blocked the sender — a fully-blocked message is dropped upstream and
+        never published at all (see websocket/router.py::_handle_message).
+        """
+        skip: set[str] = set()
+        if "_skip_user_ids" in data:
+            try:
+                payload = json.loads(data)
+                skip = {str(u) for u in payload.pop("_skip_user_ids", [])}
+                data = json.dumps(payload)
+            except (ValueError, TypeError, AttributeError):
+                logger.warning("Could not parse _skip_user_ids; delivering to all")
+                skip = set()
+
         user_sockets = self._conv_connections.get(conversation_id, {})
         disconnected: list[tuple[str, WebSocket]] = []
 
         for user_id, sockets in user_sockets.items():
+            if user_id in skip:
+                continue
             for ws in sockets:
                 try:
                     await ws.send_text(data)

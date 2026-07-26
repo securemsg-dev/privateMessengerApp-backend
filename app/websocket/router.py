@@ -42,7 +42,7 @@ import json
 import logging
 from datetime import datetime, timezone
 from typing import Optional
-from uuid import UUID
+from uuid import UUID, uuid4
 
 from fastapi import APIRouter, Query, WebSocket, WebSocketDisconnect, status
 from jose import JWTError
@@ -56,6 +56,7 @@ from app.db.models.message import MessageMetadata, MessageType
 from app.db.models.message_reaction import MessageReaction
 from app.db.models.user import User
 from app.db.session import AsyncSessionLocal
+from app.services.moderation_service import participant_ids, recipients_blocking
 from app.services.push_service import send_push_to_users
 from app.websocket.manager import manager
 from app.websocket.throttle import ConnectionThrottle
@@ -190,6 +191,34 @@ async def _handle_message(
                 )
                 return
 
+        # ── Block enforcement (Google Play UGC policy) ────────────────────
+        # Checked at SEND time, not read time: a message nobody is allowed to
+        # receive is never written, so it cannot resurface later through
+        # history pagination or an unblock.
+        others = await participant_ids(db, conversation_id) - {user_id}
+        blockers = await recipients_blocking(db, conversation_id, user_id)
+        fully_blocked = bool(others) and others <= blockers
+
+        if fully_blocked:
+            # Every possible recipient has blocked the sender. Echo the event
+            # back to the sender's own socket ONLY, so their UI shows the
+            # message as sent and they are never told they were blocked —
+            # telling them turns a safety tool into a provocation. The id is
+            # a throwaway: nothing was persisted.
+            await websocket.send_text(json.dumps({
+                "type": "message",
+                "conversation_id": conv_id_str,
+                "sender_id": user_id_str,
+                "message_id": str(uuid4()),
+                "client_temp_id": client_temp_id,
+                "encrypted_payload": encrypted_payload,
+                "message_type": message_type_str,
+                "self_destruct": self_destruct,
+                "reply_to_id": str(reply_to_id) if reply_to_id else None,
+                "timestamp": datetime.now(timezone.utc).isoformat(),
+            }))
+            return
+
         msg = MessageMetadata(
             conversation_id=conversation_id,
             sender_id=user_id,
@@ -217,6 +246,11 @@ async def _handle_message(
         "reply_to_id": str(reply_to_id) if reply_to_id else None,
         "timestamp": msg.created_at.isoformat(),
     }
+    # Group case: some members blocked the sender but others didn't, so the
+    # message is stored and delivered — just not to the blockers. The manager
+    # strips this key before it reaches any socket.
+    if blockers:
+        event["_skip_user_ids"] = [str(uid) for uid in blockers]
     await manager.publish(redis, conv_id_str, event)
 
     # Notify the OTHER participants out-of-band: an in-app live update over
@@ -254,6 +288,11 @@ async def _notify_new_message(
                 )
             )
             other_ids: list[UUID] = [r.user_id for r in rows]
+            # Participants who blocked the sender get no live update and no
+            # push either — otherwise a block would still leak a banner.
+            skip = {str(u) for u in event.get("_skip_user_ids", [])}
+            if skip:
+                other_ids = [u for u in other_ids if str(u) not in skip]
             if not other_ids:
                 return
 
@@ -272,6 +311,7 @@ async def _notify_new_message(
                 "sender_name": sender_name,
                 "sender_private_number": sender_private_number,
             }
+            notification.pop("_skip_user_ids", None)  # server-internal routing hint
 
             offline_ids: list[UUID] = []
             for uid in other_ids:

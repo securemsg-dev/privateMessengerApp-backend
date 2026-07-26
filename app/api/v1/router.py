@@ -17,6 +17,7 @@ from app.api.v1.endpoints import (
     devices,
     media,
     messages,
+    moderation,
     users,
     webrtc,
 )
@@ -45,3 +46,6 @@ api_router.include_router(media.router)         # /api/v1/media/...
 # Phase E — WebRTC runtime config + call history
 api_router.include_router(webrtc.router)        # /api/v1/webrtc/...
 api_router.include_router(calls.router)         # /api/v1/calls/...
+
+# Safety — block + report (Google Play UGC policy requirements)
+api_router.include_router(moderation.router)    # /api/v1/blocks, /api/v1/reports

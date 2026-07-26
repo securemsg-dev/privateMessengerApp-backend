@@ -39,6 +39,7 @@ from app.core.security import verify_access_token
 from app.db.models.conversation import conversation_participants
 from app.db.models.user import User
 from app.db.session import AsyncSessionLocal
+from app.services.moderation_service import blocks_exist_between
 from app.services.push_service import send_push_to_users
 from app.websocket.manager import manager
 from app.websocket.throttle import ConnectionThrottle
@@ -113,10 +114,22 @@ async def _share_a_conversation(user_a: UUID, user_b: UUID) -> bool:
             )
         )
         verdict = bool(result.scalar())
+
+        # A block in EITHER direction kills call signaling: if I blocked you
+        # I don't want your ring, and if you blocked me I must not be able to
+        # reach you. The caller just sees "Recipient unreachable" — the same
+        # thing they'd see if the callee were simply offline, so the block
+        # still isn't distinguishable from bad luck.
+        if verdict and await blocks_exist_between(db, user_a, user_b):
+            verdict = False
+
     # Only cache positive verdicts: a negative cached right before the pair's
     # first conversation is created (add contact → immediately call) would
     # silently drop their signaling for the TTL. Negative lookups are rare
     # (unauthorized frames), so skipping the cache there costs little.
+    #
+    # It also means an unblock takes effect immediately, rather than waiting
+    # out a cached negative verdict.
     if verdict:
         _share_cache_put(user_a, user_b, verdict)
     return verdict

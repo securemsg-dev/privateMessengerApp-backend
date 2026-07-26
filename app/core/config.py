@@ -43,7 +43,14 @@ class Settings(BaseSettings):
     # Shown on the public /delete-account page as the fallback channel for
     # users who can no longer sign in. Google Play requires a reachable
     # contact there, so this must be a monitored inbox in production.
-    SUPPORT_EMAIL: str = "support@cricchat.app"
+    SUPPORT_EMAIL: str = "securemsg.admin2026@gmail.com"
+    # Abuse-report inbox published on /report-abuse. Google Play's User
+    # Generated Content policy requires a reachable reporting channel that
+    # does NOT need the app installed. Blank falls back to SUPPORT_EMAIL.
+    ABUSE_EMAIL: str = ""
+    # Published turnaround for abuse reports. Whatever is stated here is a
+    # commitment to Google — do not raise it without being able to meet it.
+    ABUSE_RESPONSE_HOURS: int = 24
     # Data controller named in the privacy policy, e.g.
     # "Acme Pte. Ltd., registered in Singapore". Left blank the policy simply
     # omits the sentence rather than publishing a placeholder — a wrong entity
