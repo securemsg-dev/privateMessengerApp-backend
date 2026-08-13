@@ -9,6 +9,8 @@ User profile endpoints.
                    does not return user data.
 """
 
+import logging
+
 from fastapi import APIRouter, HTTPException, Request, status
 
 from app.core.dependencies import CurrentUser, DBSession
@@ -20,6 +22,8 @@ from app.schemas.messaging import (
     UserPublic,
 )
 from app.services import auth_service
+
+logger = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/users", tags=["Users"])
 
@@ -103,6 +107,35 @@ async def change_password(
             detail=str(exc),
         )
     return MessageResponse(message="Password changed")
+
+
+@router.delete(
+    "/me",
+    response_model=MessageResponse,
+    status_code=status.HTTP_200_OK,
+    summary="Permanently delete the caller's own account",
+)
+@limiter.limit("3/minute")
+async def delete_me(
+    request: Request,
+    current_user: CurrentUser,
+    db: DBSession,
+) -> MessageResponse:
+    """
+    Authenticated self-service account deletion — required by App Store
+    Guideline 5.1.1(v) and Google Play's account-deletion policy, and reachable
+    from Settings while signed in.
+
+    Hard-deletes the caller's account: FK cascades wipe devices, sessions,
+    contacts, messages, and conversation participations, and owned media blobs
+    are removed from storage. Irreversible.
+
+    Distinct from POST /auth/confirm-delete, which deletes via a delete-intent
+    token issued by the delete-password login flow (no authenticated session).
+    """
+    await auth_service.delete_user_by_id(current_user.id, db)
+    logger.info("[DELETE_ME] user_id=%s", current_user.id)
+    return MessageResponse(message="Account deleted.")
 
 
 @router.post(
