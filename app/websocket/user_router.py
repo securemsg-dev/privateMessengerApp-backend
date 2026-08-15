@@ -250,9 +250,14 @@ async def user_websocket_endpoint(
                         # this guard a sleeping callee gets a ~10× notification
                         # storm. A Redis SET NX with the ring-timeout TTL
                         # collapses the resends into a single notification.
+                        # An ICE-restart offer re-uses the call_id of a call
+                        # that is already up (the client renegotiates in place
+                        # after a network handover). It must never ring or push
+                        # — and it can arrive long after the Redis guard below
+                        # has expired, so check the flag first.
                         call_id = data.get("call_id")
-                        first_offer = True
-                        if call_id:
+                        first_offer = not data.get("ice_restart")
+                        if call_id and first_offer:
                             first_offer = bool(
                                 await redis.set(
                                     f"call_push:{call_id}", "1", nx=True, ex=35
