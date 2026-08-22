@@ -25,10 +25,15 @@ from uuid import UUID
 
 from fastapi import APIRouter, HTTPException, Request, status
 from jose import JWTError
+from sqlalchemy import select
+from sqlalchemy.exc import IntegrityError
+
+from app.db.models.user import User
 
 from app.core.config import settings
 from app.core.dependencies import DBSession
 from app.core.limiter import limiter
+from app.core.private_number import generate_private_number
 from app.core.security import (
     create_delete_intent_token,
     verify_delete_intent_token,
@@ -40,6 +45,7 @@ from app.schemas.auth import (
     LoginResponse,
     MessageResponse,
     RefreshRequest,
+    RegisterBeginResponse,
     RegisterRequest,
     RegisterResponse,
     TokenPair,
@@ -95,10 +101,42 @@ async def _record_login_failure(redis, private_number: str) -> None:
 # ── Registration ──────────────────────────────────────────────────────────────
 
 @router.post(
+    "/register/begin",
+    response_model=RegisterBeginResponse,
+    status_code=status.HTTP_200_OK,
+    summary="Allocate a candidate private_number for registration (step 1 of 2)",
+)
+@limiter.limit("10/minute")
+async def register_begin(
+    request: Request,
+    db: DBSession,
+) -> RegisterBeginResponse:
+    """
+    Return a candidate 10-digit private_number the client uses as the KDF salt
+    to derive its auth verifiers and key-backup wrap key before completing
+    registration. The number is NOT persisted here — /register enforces
+    uniqueness via the DB constraint, so a candidate taken in the meantime
+    just yields a 409 and the client retries begin. We still probe the table
+    to hand back a currently-free candidate and keep retries rare.
+    """
+    for _ in range(10):
+        candidate = generate_private_number()
+        exists = await db.execute(
+            select(User.id).where(User.private_number == candidate)
+        )
+        if exists.scalar_one_or_none() is None:
+            return RegisterBeginResponse(private_number=candidate)
+    raise HTTPException(
+        status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+        detail="Could not allocate a private number, please retry",
+    )
+
+
+@router.post(
     "/register",
     response_model=RegisterResponse,
     status_code=status.HTTP_201_CREATED,
-    summary="Register a new account (generates private_number)",
+    summary="Complete registration with a client-allocated private_number (step 2 of 2)",
 )
 @limiter.limit("5/minute")
 async def register(
@@ -107,30 +145,43 @@ async def register(
     db: DBSession,
 ) -> RegisterResponse:
     """
-    Create a new account. The server generates a unique 10-digit private_number
-    and stores bcrypt hashes of both passwords. The user is auto-logged-in
-    (tokens returned inline).
+    Create the account using the `private_number` from /register/begin. The
+    server stores bcrypt hashes of the client-derived verifiers (in
+    login_password / delete_password) plus the E2EE public key and encrypted
+    key backup. Auto-logs-in (tokens returned inline). If the candidate number
+    was taken between begin and complete, returns 409 so the client retries.
     """
     client_ip = request.client.host if request.client else "unknown"
     logger.info("[REGISTER] Request from %s | display_name=%r", client_ip, body.display_name)
     try:
         user = await auth_service.register_user(
+            private_number=body.private_number,
             login_password=body.login_password,
             delete_password=body.delete_password,
             display_name=body.display_name,
+            public_key=body.public_key,
+            encrypted_key_backup=body.encrypted_key_backup,
             db=db,
         )
-        logger.info("[REGISTER] User created | id=%s private_number=%s", user.id, _mask(user.private_number))
-        tokens = await auth_service.create_session(user, db)
-        logger.info("[REGISTER] Session created | user_id=%s", user.id)
-        return RegisterResponse(
-            user=UserResponse.model_validate(user),
-            tokens=tokens,
-            private_number=user.private_number,
+    except IntegrityError:
+        await db.rollback()
+        logger.info("[REGISTER] private_number collision | %s", _mask(body.private_number))
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail="private_number just taken, request a new one",
         )
     except Exception as exc:
         logger.exception("[REGISTER] Failed for display_name=%r | error=%s", body.display_name, exc)
         raise
+
+    logger.info("[REGISTER] User created | id=%s private_number=%s", user.id, _mask(user.private_number))
+    tokens = await auth_service.create_session(user, db)
+    logger.info("[REGISTER] Session created | user_id=%s", user.id)
+    return RegisterResponse(
+        user=UserResponse.model_validate(user),
+        tokens=tokens,
+        private_number=user.private_number,
+    )
 
 
 # ── Login ─────────────────────────────────────────────────────────────────────
@@ -188,6 +239,7 @@ async def login(
         return LoginResponse(
             user=UserResponse.model_validate(user),
             tokens=tokens,
+            encrypted_key_backup=user.encrypted_key_backup,
         )
 
     # AuthOutcome.DELETE_INTENT — do NOT create a session, do NOT return user/tokens.

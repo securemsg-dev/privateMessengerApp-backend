@@ -95,6 +95,7 @@ async def change_password(
             new_password=body.new_password,
             keep_refresh_token=body.refresh_token,
             db=db,
+            encrypted_key_backup=body.encrypted_key_backup,
         )
     except PermissionError:
         raise HTTPException(

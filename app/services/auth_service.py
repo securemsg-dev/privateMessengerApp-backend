@@ -52,21 +52,32 @@ def _hash_refresh_token(token: str) -> str:
 
 
 async def register_user(
+    private_number: str,
     login_password: str,
     delete_password: str,
     display_name: Optional[str],
     db: AsyncSession,
+    public_key: Optional[str] = None,
+    encrypted_key_backup: Optional[str] = None,
 ) -> User:
     """
-    Create a new user with a freshly generated private_number and two bcrypt
-    password hashes. Returns the persisted User (flushed, not committed).
+    Create a new user with the client-supplied `private_number` (allocated by
+    /auth/register/begin) and two bcrypt hashes of the client-derived
+    verifiers. `public_key` and `encrypted_key_backup` are stored as-is so a
+    new device can later restore the E2EE key.
+
+    The caller must translate a unique-constraint IntegrityError on flush into
+    HTTP 409 (candidate number taken between begin and complete) so the client
+    can retry with a fresh candidate. Returns the persisted User (flushed, not
+    committed).
     """
-    private_number = await generate_unique_private_number(db)
     user = User(
         private_number=private_number,
         login_password_hash=await hash_password_async(login_password),
         delete_password_hash=await hash_password_async(delete_password),
         display_name=display_name,
+        public_key=public_key,
+        encrypted_key_backup=encrypted_key_backup,
     )
     db.add(user)
     await db.flush()
@@ -139,6 +150,7 @@ async def change_login_password(
     new_password: str,
     keep_refresh_token: Optional[str],
     db: AsyncSession,
+    encrypted_key_backup: Optional[str] = None,
 ) -> None:
     """
     Change the user's LOGIN password (delete password is untouched).
@@ -164,6 +176,10 @@ async def change_login_password(
         raise ValueError("Please choose a different password")
 
     user.login_password_hash = await hash_password_async(new_password)
+    # Re-wrapped under the new password's wrap key so history still decrypts.
+    # Only overwrite when supplied — never clobber an existing backup with null.
+    if encrypted_key_backup is not None:
+        user.encrypted_key_backup = encrypted_key_backup
 
     keep_hash = _hash_refresh_token(keep_refresh_token) if keep_refresh_token else None
     result = await db.execute(

@@ -40,9 +40,31 @@ def validate_password_bytes(v: str) -> str:
 # ── Request schemas ───────────────────────────────────────────────────────────
 
 class RegisterRequest(BaseModel):
+    """
+    Complete registration (step 2 of 2 — see /auth/register/begin).
+
+    `login_password` / `delete_password` carry the client-derived AUTH
+    VERIFIERS, not raw passwords: the client runs a KDF over the real password
+    with salt = hash(private_number) and sends only the verifier. The server
+    treats each verifier as an opaque secret and bcrypt-hashes it exactly as
+    before — it never sees the raw password, so it cannot derive the wrap key
+    that protects `encrypted_key_backup`.
+
+    `private_number` is the value returned by /auth/register/begin. The unique
+    constraint on users.private_number resolves the (rare) race where two
+    clients complete with the same candidate — the loser gets 409 and retries.
+    """
+    private_number: str
     display_name: Optional[str] = Field(None, max_length=100)
     login_password: str = Field(min_length=MIN_PASSWORD_LEN)
     delete_password: str = Field(min_length=MIN_PASSWORD_LEN)
+    public_key: Optional[str] = None
+    encrypted_key_backup: Optional[str] = None
+
+    @field_validator("private_number")
+    @classmethod
+    def _validate_private_number(cls, v: str) -> str:
+        return validate_private_number(v)
 
     @field_validator("login_password", "delete_password")
     @classmethod
@@ -81,6 +103,10 @@ class ChangePasswordRequest(BaseModel):
     current_password: str
     new_password: str = Field(min_length=MIN_PASSWORD_LEN)
     refresh_token: Optional[str] = None
+    # Re-wrapped key backup: the SAME private key re-encrypted under a wrap key
+    # derived from the new password, so old messages still decrypt after a
+    # password change. Required whenever the client uses key recovery.
+    encrypted_key_backup: Optional[str] = None
 
     @field_validator("new_password")
     @classmethod
@@ -119,10 +145,19 @@ class RegisterResponse(BaseModel):
     private_number: str  # echoed for convenience on reveal screen
 
 
+class RegisterBeginResponse(BaseModel):
+    """Step 1 of registration — a candidate private_number for the client to
+    derive its verifiers/wrap key against. Not persisted until /register."""
+    private_number: str
+
+
 class LoginResponse(BaseModel):
     action: Literal["authenticated"] = "authenticated"
     user: UserResponse
     tokens: TokenPair
+    # The caller's encrypted private-key backup, so a new device can restore
+    # the key and decrypt history. Null for legacy accounts without a backup.
+    encrypted_key_backup: Optional[str] = None
 
 
 class DeleteIntentResponse(BaseModel):
