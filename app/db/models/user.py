@@ -50,6 +50,13 @@ class User(UUIDPrimaryKeyMixin, TimestampMixin, Base):
         comment="Base64 Curve25519 public key for E2EE (Phase B). "
                 "Single long-term key per user; private key stays on device.",
     )
+    encrypted_key_backup: Mapped[Optional[str]] = mapped_column(
+        Text, nullable=True,
+        comment="The user's private key, encrypted client-side with a wrap key "
+                "derived from their password via a path the server never sees "
+                "(split-derivation). Opaque to the server — enables new-device "
+                "recovery without the server being able to decrypt it.",
+    )
     is_active: Mapped[bool] = mapped_column(
         Boolean, default=True, nullable=False,
         comment="Soft delete flag",
