@@ -50,11 +50,15 @@ class RegisterRequest(BaseModel):
     before — it never sees the raw password, so it cannot derive the wrap key
     that protects `encrypted_key_backup`.
 
-    `private_number` is the value returned by /auth/register/begin. The unique
+    `private_number` is the value returned by /auth/register/begin, and
+    `registration_token` is the signed token issued alongside it. The server
+    verifies the token binds this exact number, so only server-issued numbers
+    are accepted (no client-chosen numbers, no existence probing). The unique
     constraint on users.private_number resolves the (rare) race where two
     clients complete with the same candidate — the loser gets 409 and retries.
     """
     private_number: str
+    registration_token: str
     display_name: Optional[str] = Field(None, max_length=100)
     login_password: str = Field(min_length=MIN_PASSWORD_LEN)
     delete_password: str = Field(min_length=MIN_PASSWORD_LEN)
@@ -147,8 +151,10 @@ class RegisterResponse(BaseModel):
 
 class RegisterBeginResponse(BaseModel):
     """Step 1 of registration — a candidate private_number for the client to
-    derive its verifiers/wrap key against. Not persisted until /register."""
+    derive its verifiers/wrap key against, plus a signed token binding that
+    number. /register requires the token back. Not persisted until /register."""
     private_number: str
+    registration_token: str
 
 
 class LoginResponse(BaseModel):

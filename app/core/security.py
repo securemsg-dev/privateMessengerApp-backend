@@ -136,3 +136,32 @@ def verify_delete_intent_token(token: str) -> dict[str, Any]:
     if payload.get("type") != DELETE_INTENT_TOKEN_TYPE:
         raise JWTError("Token is not a delete-intent token")
     return payload
+
+
+# ── Registration token ────────────────────────────────────────────────────────
+# Issued by POST /auth/register/begin, binding the server-allocated candidate
+# private_number. POST /auth/register requires it and checks the bound number
+# matches the submitted one, so a client can only register a number the server
+# actually issued. This keeps number assignment server-authoritative: clients
+# cannot pick arbitrary numbers (squatting) and cannot probe registration
+# existence via /register's 409 (they can't mint a token for a number of their
+# choosing).
+
+REGISTRATION_TOKEN_TYPE = "registration"
+
+
+def create_registration_token(private_number: str) -> str:
+    """Short-lived token binding a server-issued candidate private_number."""
+    return _create_token(
+        subject=private_number,
+        token_type=REGISTRATION_TOKEN_TYPE,
+        expires_delta=timedelta(minutes=10),
+    )
+
+
+def verify_registration_token(token: str) -> str:
+    """Decode a registration token and return the private_number it binds."""
+    payload = decode_token(token)
+    if payload.get("type") != REGISTRATION_TOKEN_TYPE:
+        raise JWTError("Token is not a registration token")
+    return str(payload["sub"])

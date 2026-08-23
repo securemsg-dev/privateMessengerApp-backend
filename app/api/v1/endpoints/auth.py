@@ -36,7 +36,9 @@ from app.core.limiter import limiter
 from app.core.private_number import generate_private_number
 from app.core.security import (
     create_delete_intent_token,
+    create_registration_token,
     verify_delete_intent_token,
+    verify_registration_token,
 )
 from app.schemas.auth import (
     ConfirmDeleteRequest,
@@ -125,7 +127,10 @@ async def register_begin(
             select(User.id).where(User.private_number == candidate)
         )
         if exists.scalar_one_or_none() is None:
-            return RegisterBeginResponse(private_number=candidate)
+            return RegisterBeginResponse(
+                private_number=candidate,
+                registration_token=create_registration_token(candidate),
+            )
     raise HTTPException(
         status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
         detail="Could not allocate a private number, please retry",
@@ -153,6 +158,23 @@ async def register(
     """
     client_ip = request.client.host if request.client else "unknown"
     logger.info("[REGISTER] Request from %s | display_name=%r", client_ip, body.display_name)
+
+    # The number must be one /register/begin actually issued: verify the signed
+    # token and that it binds this exact number. Blocks client-chosen numbers
+    # (squatting) and unauthenticated existence probing via the 409 path.
+    try:
+        bound_number = verify_registration_token(body.registration_token)
+    except JWTError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Invalid or expired registration token — call /register/begin first",
+        ) from exc
+    if bound_number != body.private_number:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="private_number does not match the registration token",
+        )
+
     try:
         user = await auth_service.register_user(
             private_number=body.private_number,
