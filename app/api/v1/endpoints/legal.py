@@ -28,7 +28,7 @@ router = APIRouter()
 APP_DISPLAY_NAME = "Cricchat"
 
 # Bump when the policy text materially changes; shown in each page footer.
-LAST_UPDATED = "19 July 2026"
+LAST_UPDATED = "24 August 2026"
 
 _CSS = """
   :root {
@@ -139,8 +139,9 @@ def _privacy_body() -> str:
       <tr>
         <td><strong>Password hashes</strong> — for your sign-in password and
         your delete password</td>
-        <td>Authentication. Passwords are stored only as one-way hashes and are
-        never recoverable in plain text.</td>
+        <td>Authentication. Your device never sends us your actual password —
+        it sends a value derived from it, which we store only as a one-way
+        hash. Your password can never be recovered from what we hold.</td>
       </tr>
       <tr>
         <td><strong>Profile details</strong> — optional display name, bio, and
@@ -151,7 +152,15 @@ def _privacy_body() -> str:
       <tr>
         <td><strong>Public encryption key</strong></td>
         <td>Distributed to people you message so their device can encrypt to
-        you. The matching private key never leaves your device.</td>
+        you. The matching private key stays on your device; only an encrypted
+        backup you alone can unlock is stored — see the next row.</td>
+      </tr>
+      <tr>
+        <td><strong>Encrypted key backup</strong></td>
+        <td>A copy of your private key, encrypted on your device with a key
+        derived from your password that we never receive. Stored so you can
+        restore your messages when you sign in on a new device. We cannot
+        decrypt it.</td>
       </tr>
       <tr>
         <td><strong>Encrypted messages and media</strong> — ciphertext only,
@@ -199,11 +208,15 @@ def _privacy_body() -> str:
   <p>
     Messages and media are encrypted on your device before they are sent, and
     can only be decrypted by the intended recipient. Your private key is
-    generated on your device and stored in your device's secure keystore — it
-    is never transmitted to us. As a result we cannot read your messages or
-    media, and cannot produce readable content in response to any request,
-    including a lawful one. Calls are peer-to-peer and encrypted; we handle
-    only the signalling needed to connect them.
+    generated on your device. So that you can restore your conversations when
+    you get a new phone, an encrypted backup of that key is stored on our
+    servers — but it is encrypted on your device with a key derived from your
+    password, and your password is never sent to us in a form we could use to
+    unlock it. We cannot decrypt your backup, your messages, or your media, and
+    cannot produce readable content in response to any request, including a
+    lawful one. Because your backup is protected by your password, choose a
+    strong, unique one. Calls are peer-to-peer and encrypted; we handle only
+    the signalling needed to connect them.
   </p>
   <p>
     Push notifications never contain message content. They tell your device
