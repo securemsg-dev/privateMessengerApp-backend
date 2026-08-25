@@ -26,7 +26,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.config import settings
 from app.core.security import DELETE_INTENT_TOKEN_TYPE
-from tests.conftest import auth_header, register_and_login
+from tests.conftest import auth_header, begin_registration, register_and_login
 
 
 # ── Registration ──────────────────────────────────────────────────────────────
@@ -37,12 +37,13 @@ async def test_register_new_user(client: AsyncClient):
     response = await client.post(
         "/api/v1/auth/register",
         json={
+            **await begin_registration(client),
             "login_password": "LoginPass123",
             "delete_password": "DeletePass456",
             "display_name": "Alice",
         },
     )
-    assert response.status_code == 201
+    assert response.status_code == 201, response.text
     data = response.json()
     assert data["user"]["display_name"] == "Alice"
     assert data["user"]["is_active"] is True
@@ -58,13 +59,22 @@ async def test_register_generates_unique_private_numbers(client: AsyncClient):
     """Two registrations produce distinct private_numbers."""
     r1 = await client.post(
         "/api/v1/auth/register",
-        json={"login_password": "LoginPass123", "delete_password": "DeletePass456"},
+        json={
+            **await begin_registration(client),
+            "login_password": "LoginPass123",
+            "delete_password": "DeletePass456",
+        },
     )
     r2 = await client.post(
         "/api/v1/auth/register",
-        json={"login_password": "LoginPass123", "delete_password": "DeletePass456"},
+        json={
+            **await begin_registration(client),
+            "login_password": "LoginPass123",
+            "delete_password": "DeletePass456",
+        },
     )
-    assert r1.status_code == 201 and r2.status_code == 201
+    assert r1.status_code == 201, r1.text
+    assert r2.status_code == 201, r2.text
     assert r1.json()["private_number"] != r2.json()["private_number"]
 
 
@@ -73,9 +83,16 @@ async def test_register_rejects_matching_passwords(client: AsyncClient):
     """login_password == delete_password → 422."""
     response = await client.post(
         "/api/v1/auth/register",
-        json={"login_password": "SamePass1234", "delete_password": "SamePass1234"},
+        json={
+            **await begin_registration(client),
+            "login_password": "SamePass1234",
+            "delete_password": "SamePass1234",
+        },
     )
     assert response.status_code == 422
+    # Assert on the reason, not just the code — without the registration fields
+    # this test would 422 for "missing field" and still pass vacuously.
+    assert "must be different" in response.text
 
 
 @pytest.mark.asyncio
@@ -83,9 +100,14 @@ async def test_register_rejects_short_password(client: AsyncClient):
     """< 8 chars login_password → 422."""
     response = await client.post(
         "/api/v1/auth/register",
-        json={"login_password": "short1", "delete_password": "DeletePass456"},
+        json={
+            **await begin_registration(client),
+            "login_password": "short1",
+            "delete_password": "DeletePass456",
+        },
     )
     assert response.status_code == 422
+    assert "login_password" in response.text
 
 
 @pytest.mark.asyncio
@@ -93,9 +115,14 @@ async def test_register_rejects_short_delete_password(client: AsyncClient):
     """< 8 chars delete_password → 422."""
     response = await client.post(
         "/api/v1/auth/register",
-        json={"login_password": "LoginPass123", "delete_password": "short1"},
+        json={
+            **await begin_registration(client),
+            "login_password": "LoginPass123",
+            "delete_password": "short1",
+        },
     )
     assert response.status_code == 422
+    assert "delete_password" in response.text
 
 
 @pytest.mark.asyncio

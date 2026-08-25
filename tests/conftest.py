@@ -118,6 +118,23 @@ DEFAULT_LOGIN_PW = "LoginPass123"
 DEFAULT_DELETE_PW = "DeletePass456"
 
 
+async def begin_registration(client: AsyncClient) -> dict[str, str]:
+    """
+    Run step 1 of registration and return {"private_number", "registration_token"}.
+
+    Tests that POST /auth/register directly need these two fields: /register only
+    accepts a private_number vouched for by a token from /register/begin. Spread
+    the result into the request body — `{**await begin_registration(client), ...}`.
+    """
+    resp = await client.post("/api/v1/auth/register/begin")
+    assert resp.status_code == 200, resp.text
+    data = resp.json()
+    return {
+        "private_number": data["private_number"],
+        "registration_token": data["registration_token"],
+    }
+
+
 async def register_and_login(
     client: AsyncClient,
     login_password: str = DEFAULT_LOGIN_PW,
@@ -127,8 +144,18 @@ async def register_and_login(
     """
     Helper: register a new user → returns dict with tokens + private_number.
     Registration auto-logs-in, so no separate login call needed.
+
+    Registration is TWO steps since the registration_token change: /register/begin
+    allocates the private_number (the client's KDF salt) and signs a token binding
+    it, and /register will only accept a number that token vouches for.
     """
+    begin = await client.post("/api/v1/auth/register/begin")
+    assert begin.status_code == 200, begin.text
+    allocated = begin.json()
+
     body = {
+        "private_number": allocated["private_number"],
+        "registration_token": allocated["registration_token"],
         "login_password": login_password,
         "delete_password": delete_password,
     }
