@@ -24,8 +24,10 @@ import logging
 from contextlib import asynccontextmanager
 
 import redis.asyncio as aioredis
-from fastapi import FastAPI
+from fastapi import FastAPI, Request
+from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import JSONResponse
 from slowapi import _rate_limit_exceeded_handler
 from slowapi.errors import RateLimitExceeded
 
@@ -46,6 +48,51 @@ logging.basicConfig(
     format="%(asctime)s | %(levelname)-8s | %(name)s — %(message)s",
 )
 logger = logging.getLogger(__name__)
+
+
+async def _validation_error_handler(
+    request: Request, exc: Exception
+) -> JSONResponse:
+    """
+    Log and return 422 request-validation failures.
+
+    FastAPI validates a handler's `body:` parameter BEFORE the handler runs, so
+    a 422 never reaches the per-endpoint logging inside the handler — the failed
+    request is invisible in the deploy logs while healthy traffic is visible.
+    That made a broken client look like a silent server. Log the failures here.
+
+    Only the field LOCATION and error TYPE are logged. The `input` value is
+    deliberately never logged and is stripped from the response: on /auth
+    routes it holds the client-derived password verifiers, which must not land
+    in log aggregators or error payloads.
+    """
+    errors = exc.errors() if isinstance(exc, RequestValidationError) else []
+    fields = [
+        f"{'.'.join(str(p) for p in err.get('loc', ()) if p != 'body')}"
+        f"[{err.get('type', '?')}]"
+        for err in errors
+    ]
+    logger.warning(
+        "[422] %s %s | %d invalid field(s): %s",
+        request.method,
+        request.url.path,
+        len(errors),
+        ", ".join(fields) or "(none)",
+    )
+    # Mirror FastAPI's default body, minus `input`/`ctx` so secrets aren't echoed.
+    return JSONResponse(
+        status_code=422,
+        content={
+            "detail": [
+                {
+                    "type": err.get("type"),
+                    "loc": list(err.get("loc", ())),
+                    "msg": err.get("msg"),
+                }
+                for err in errors
+            ]
+        },
+    )
 
 
 @asynccontextmanager
@@ -124,6 +171,9 @@ def create_app() -> FastAPI:
     # ── Rate limiter ──────────────────────────────────────────────────────
     app.state.limiter = limiter
     app.add_exception_handler(RateLimitExceeded, _rate_limit_exceeded_handler)
+
+    # ── Request-validation (422) logging ──────────────────────────────────
+    app.add_exception_handler(RequestValidationError, _validation_error_handler)
 
     # ── CORS ──────────────────────────────────────────────────────────────
     app.add_middleware(
