@@ -315,6 +315,10 @@ async def _setup_pair(sender_number: str, peer_number: str, block: bool):
         return sender.id, peer.id, conv.id
 
 
+
+async def _noop_presence(*_args, **_kwargs) -> None:
+    return None
+
 @pytest.fixture
 def ws_client():
     """TestClient with the WS routers pointed at the test DB (mirrors
@@ -344,6 +348,13 @@ def ws_client():
         "app.websocket.router.AsyncSessionLocal", TestSessionLocal,
     ), patch(
         "app.websocket.user_router.AsyncSessionLocal", TestSessionLocal,
+    ), patch(
+        "app.services.presence.AsyncSessionLocal", TestSessionLocal,
+    ), patch(
+        # Presence runs in background tasks on the TestClient loop; these
+        # tests don't exercise it (see test_presence.py), so keep it from
+        # racing them for the shared in-memory SQLite connection.
+        "app.main.on_presence_change", new=_noop_presence,
     ):
         with TestClient(app) as client:
             yield client

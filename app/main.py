@@ -38,6 +38,7 @@ from app.core.limiter import limiter
 from app.db.session import engine
 from app.services.maintenance import run_maintenance_loop
 from app.services.media_storage import default_storage, get_backend
+from app.services.presence import on_presence_change, run_presence_loop
 from app.services.push_service import close_http_client
 from app.websocket.manager import manager
 from app.websocket.router import router as ws_router
@@ -134,11 +135,23 @@ async def lifespan(app: FastAPI):
     )
     logger.info("Maintenance sweeper started")
 
+    # Presence: the manager reports online/offline transitions; the loop
+    # keeps Redis presence keys alive for users active on this instance.
+    manager.set_presence_hook(
+        lambda user_id, online: on_presence_change(redis_client, user_id, online)
+    )
+    presence_task = asyncio.create_task(
+        run_presence_loop(redis_client),
+        name="presence-refresh",
+    )
+
     yield
 
     # ── Shutdown ──────────────────────────────────────────────────────────
     logger.info("Shutting down %s", settings.APP_NAME)
-    for task in (subscriber_task, maintenance_task):
+    manager.set_presence_hook(None)
+    await manager.drain_presence_tasks()
+    for task in (subscriber_task, maintenance_task, presence_task):
         task.cancel()
         try:
             await task

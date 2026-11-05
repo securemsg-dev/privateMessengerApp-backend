@@ -50,6 +50,13 @@ class ProfileUpdateRequest(BaseModel):
     display_name: Optional[str] = Field(None, max_length=100)
     bio: Optional[str] = Field(None, max_length=128)
     profile_picture_key: Optional[str] = Field(None, max_length=512)
+    # Presence privacy: false hides online / last seen from everyone.
+    show_online_status: Optional[bool] = None
+
+
+class MeResponse(UserPublic):
+    """The caller's own profile — includes their private settings."""
+    show_online_status: bool = True
 
 
 # ── Contact lookup ─────────────────────────────────────────────────────────────

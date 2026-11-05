@@ -26,9 +26,11 @@ Channel naming:
   user:{user_id}                     — targeted user fan-out (Phase E+)
 """
 
+import asyncio
 import json
 import logging
 from collections import defaultdict
+from typing import Awaitable, Callable
 from uuid import UUID  # noqa: F401  (kept for callers; UUIDs stringified at boundary)
 
 import redis.asyncio as aioredis
@@ -38,6 +40,13 @@ logger = logging.getLogger(__name__)
 
 CONV_CHANNEL_PREFIX = "conversation"
 USER_CHANNEL_PREFIX = "user"
+
+
+def _is_presence_event(data: str) -> bool:
+    try:
+        return json.loads(data).get("type") == "presence"
+    except (ValueError, AttributeError):
+        return False
 
 
 class ConnectionManager:
@@ -53,6 +62,17 @@ class ConnectionManager:
         )
         # { user_id: [WebSocket] } — call signaling + future user-targeted events
         self._user_connections: dict[str, list[WebSocket]] = defaultdict(list)
+        # Presence: per user-socket "app in foreground" flag. A fresh socket
+        # counts as active — old app builds never report state, and an open
+        # user socket is exactly what "online" meant before.
+        self._user_socket_active: dict[WebSocket, bool] = {}
+        # Conversation sockets that asked for presence events (?presence=1).
+        # Old builds never ask, so they never see the new frames.
+        self._presence_sockets: set[WebSocket] = set()
+        # Called (in a background task) whenever a user's aggregate active
+        # state flips. Registered by the presence service at startup.
+        self._presence_hook: Optional[Callable[[str, bool], Awaitable[None]]] = None
+        self._presence_tasks: set[asyncio.Task] = set()
 
     # ── Per-conversation lifecycle ────────────────────────────────────────────
 
@@ -61,9 +81,13 @@ class ConnectionManager:
         websocket: WebSocket,
         conversation_id: str,
         user_id: str,
+        *,
+        wants_presence: bool = False,
     ) -> None:
         await websocket.accept()
         self._conv_connections[conversation_id][user_id].append(websocket)
+        if wants_presence:
+            self._presence_sockets.add(websocket)
         logger.info("WS connected: user=%s conv=%s", user_id, conversation_id)
 
     async def disconnect(
@@ -72,6 +96,7 @@ class ConnectionManager:
         conversation_id: str,
         user_id: str,
     ) -> None:
+        self._presence_sockets.discard(websocket)
         sockets = self._conv_connections[conversation_id].get(user_id, [])
         if websocket in sockets:
             sockets.remove(websocket)
@@ -84,17 +109,87 @@ class ConnectionManager:
     # ── Per-user lifecycle (Phase E) ──────────────────────────────────────────
 
     async def connect_user(self, websocket: WebSocket, user_id: str) -> None:
+        was_active = self._has_active_user_socket(user_id)
         await websocket.accept()
         self._user_connections[user_id].append(websocket)
+        self._user_socket_active[websocket] = True
         logger.info("User WS connected: user=%s", user_id)
+        if not was_active:
+            self._emit_presence(user_id, True)
 
     async def disconnect_user(self, websocket: WebSocket, user_id: str) -> None:
+        was_active = self._has_active_user_socket(user_id)
         sockets = self._user_connections.get(user_id, [])
         if websocket in sockets:
             sockets.remove(websocket)
+        self._user_socket_active.pop(websocket, None)
         if not sockets:
             self._user_connections.pop(user_id, None)
         logger.info("User WS disconnected: user=%s", user_id)
+        if was_active and not self._has_active_user_socket(user_id):
+            self._emit_presence(user_id, False)
+
+    # ── Presence ──────────────────────────────────────────────────────────────
+
+    def set_presence_hook(
+        self, hook: Optional[Callable[[str, bool], Awaitable[None]]],
+    ) -> None:
+        self._presence_hook = hook
+
+    def _has_active_user_socket(self, user_id: str) -> bool:
+        return any(
+            self._user_socket_active.get(ws, False)
+            for ws in self._user_connections.get(user_id, [])
+        )
+
+    def set_user_socket_active(self, websocket: WebSocket, user_id: str, active: bool) -> None:
+        """Client reported foreground/background on its user socket."""
+        if websocket not in self._user_socket_active:
+            return
+        was_active = self._has_active_user_socket(user_id)
+        self._user_socket_active[websocket] = active
+        now_active = self._has_active_user_socket(user_id)
+        if now_active != was_active:
+            self._emit_presence(user_id, now_active)
+
+    def active_user_ids(self) -> list[str]:
+        """Users with at least one foreground user socket on this instance."""
+        return [uid for uid in list(self._user_connections) if self._has_active_user_socket(uid)]
+
+    def is_user_active(self, user_id: str) -> bool:
+        """
+        True if the user is using the app right now (on this instance). Used to
+        decide whether a new message also needs a push: a backgrounded app may
+        still hold an open socket for a while, but it shows no banner.
+
+        Users with a user socket are judged by its reported state. Without
+        one (e.g. an old build whose user socket dropped), an open
+        conversation socket still counts — the pre-presence behaviour.
+        """
+        if self._user_connections.get(user_id):
+            return self._has_active_user_socket(user_id)
+        return any(p.get(user_id) for p in self._conv_connections.values())
+
+    async def drain_presence_tasks(self, timeout: float = 5.0) -> None:
+        """Let in-flight presence updates finish (shutdown) instead of
+        cancelling them halfway through a DB write."""
+        tasks = list(self._presence_tasks)
+        if tasks:
+            await asyncio.wait(tasks, timeout=timeout)
+
+    def _emit_presence(self, user_id: str, online: bool) -> None:
+        hook = self._presence_hook
+        if hook is None:
+            return
+        task = asyncio.create_task(hook(user_id, online))
+        self._presence_tasks.add(task)
+
+        def _done(t: asyncio.Task) -> None:
+            self._presence_tasks.discard(t)
+            if not t.cancelled() and t.exception() is not None:
+                logger.error("presence hook failed for user=%s", user_id, exc_info=t.exception())
+
+        task.add_done_callback(_done)
 
     def is_user_connected(self, user_id: str) -> bool:
         """
@@ -165,6 +260,9 @@ class ConnectionManager:
                 logger.warning("Could not parse _skip_user_ids; delivering to all")
                 skip = set()
 
+        # Presence frames only go to sockets that opted in (?presence=1).
+        presence_only = '"presence"' in data and _is_presence_event(data)
+
         user_sockets = self._conv_connections.get(conversation_id, {})
         disconnected: list[tuple[str, WebSocket]] = []
 
@@ -172,6 +270,8 @@ class ConnectionManager:
             if user_id in skip:
                 continue
             for ws in sockets:
+                if presence_only and ws not in self._presence_sockets:
+                    continue
                 try:
                     await ws.send_text(data)
                 except Exception:

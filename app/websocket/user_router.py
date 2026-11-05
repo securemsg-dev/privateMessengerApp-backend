@@ -176,6 +176,19 @@ async def user_websocket_endpoint(
                 continue
 
             event_type = data.get("type")
+
+            # Presence: the app reports foreground/background so "online"
+            # means actually using the app, not just holding a socket open.
+            if event_type == "presence":
+                state = data.get("state")
+                if state not in ("active", "background"):
+                    await websocket.send_text(
+                        json.dumps({"type": "error", "detail": "Invalid presence state"})
+                    )
+                    continue
+                manager.set_user_socket_active(websocket, user_id_str, state == "active")
+                continue
+
             if event_type not in ALLOWED_FORWARD_TYPES:
                 logger.info(
                     "Signal rejected (unknown type %r) from user=%s",

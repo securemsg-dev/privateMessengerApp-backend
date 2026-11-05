@@ -17,11 +17,13 @@ from app.core.dependencies import CurrentUser, DBSession
 from app.core.limiter import limiter
 from app.schemas.auth import ChangePasswordRequest, MessageResponse
 from app.schemas.messaging import (
+    MeResponse,
     ProfileUpdateRequest,
     PublicKeyUploadRequest,
     UserPublic,
 )
 from app.services import auth_service
+from app.services.presence import publish_presence
 
 logger = logging.getLogger(__name__)
 
@@ -30,7 +32,7 @@ router = APIRouter(prefix="/users", tags=["Users"])
 
 @router.get(
     "/me",
-    response_model=UserPublic,
+    response_model=MeResponse,
     status_code=status.HTTP_200_OK,
     summary="Get the current user's profile",
 )
@@ -38,13 +40,13 @@ router = APIRouter(prefix="/users", tags=["Users"])
 async def get_me(
     request: Request,
     current_user: CurrentUser,
-) -> UserPublic:
-    return UserPublic.model_validate(current_user)
+) -> MeResponse:
+    return MeResponse.model_validate(current_user)
 
 
 @router.patch(
     "/me",
-    response_model=UserPublic,
+    response_model=MeResponse,
     status_code=status.HTTP_200_OK,
     summary="Update the current user's display name or profile picture",
 )
@@ -54,7 +56,7 @@ async def update_me(
     body: ProfileUpdateRequest,
     current_user: CurrentUser,
     db: DBSession,
-) -> UserPublic:
+) -> MeResponse:
     """
     Partial update — only fields explicitly set (non-null) are applied.
     Pass `profile_picture_key` with the blob_id returned by POST /media/upload-url
@@ -67,8 +69,21 @@ async def update_me(
         current_user.bio = body.bio.strip() or None
     if body.profile_picture_key is not None:
         current_user.profile_picture_key = body.profile_picture_key
+    visibility_changed = (
+        body.show_online_status is not None
+        and body.show_online_status != current_user.show_online_status
+    )
+    if body.show_online_status is not None:
+        current_user.show_online_status = body.show_online_status
     await db.flush()
-    return UserPublic.model_validate(current_user)
+    if visibility_changed:
+        # Tell open chats right away (hidden → shows offline; unhidden →
+        # shows real state). Best-effort: the setting is saved either way.
+        try:
+            await publish_presence(db, request.app.state.redis, current_user)
+        except Exception:
+            logger.exception("presence publish after visibility change failed")
+    return MeResponse.model_validate(current_user)
 
 
 @router.post(

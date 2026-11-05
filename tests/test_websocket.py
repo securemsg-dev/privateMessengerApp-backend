@@ -105,6 +105,10 @@ async def _setup_user_only(identifier: str) -> uuid.UUID:
     return user_id
 
 
+
+async def _noop_presence(*_args, **_kwargs) -> None:
+    return None
+
 @pytest.fixture
 def ws_app():
     """Create a test app configured for WebSocket testing.
@@ -141,6 +145,13 @@ def ws_app():
         "app.websocket.router.AsyncSessionLocal", TestSessionLocal,
     ), patch(
         "app.websocket.user_router.AsyncSessionLocal", TestSessionLocal,
+    ), patch(
+        "app.services.presence.AsyncSessionLocal", TestSessionLocal,
+    ), patch(
+        # Presence runs in background tasks on the TestClient loop; these
+        # tests don't exercise it (see test_presence.py), so keep it from
+        # racing them for the shared in-memory SQLite connection.
+        "app.main.on_presence_change", new=_noop_presence,
     ):
         yield app
 

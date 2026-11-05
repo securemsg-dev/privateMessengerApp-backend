@@ -50,13 +50,14 @@ from sqlalchemy import select
 
 from app.core.config import settings
 from app.core.security import verify_access_token
-from app.db.models.conversation import conversation_participants
+from app.db.models.conversation import Conversation, conversation_participants
 from app.db.models.media_blob import MediaBlob
 from app.db.models.message import MessageMetadata, MessageType
 from app.db.models.message_reaction import MessageReaction
 from app.db.models.user import User
 from app.db.session import AsyncSessionLocal
 from app.services.moderation_service import participant_ids, recipients_blocking
+from app.services.presence import snapshot_for as presence_snapshot_for
 from app.services.push_service import send_push_to_users
 from app.websocket.manager import manager
 from app.websocket.throttle import ConnectionThrottle
@@ -318,11 +319,14 @@ async def _notify_new_message(
 
             offline_ids: list[UUID] = []
             for uid in other_ids:
-                if str(uid) in in_conversation:
-                    continue  # already received the full message in-thread
-                if manager.is_user_connected(str(uid)):
-                    await manager.publish_to_user(redis, str(uid), notification)
-                else:
+                uid_str = str(uid)
+                # Live chat-list update for anyone with a socket here who
+                # didn't already get the full message in-thread.
+                if uid_str not in in_conversation and manager.is_user_connected(uid_str):
+                    await manager.publish_to_user(redis, uid_str, notification)
+                # Push unless they're actively using the app: a backgrounded
+                # app can still hold a socket open but shows no banner.
+                if not manager.is_user_active(uid_str):
                     offline_ids.append(uid)
 
             if offline_ids:
@@ -509,6 +513,24 @@ async def _handle_receipt(
     await manager.publish(redis, conv_id_str, event)
 
 
+async def _send_presence_snapshot(
+    websocket: WebSocket,
+    redis: aioredis.Redis,
+    conversation_id: UUID,
+    user_id: UUID,
+) -> None:
+    """1:1 chats only: tell the connecting user whether their peer is online."""
+    async with AsyncSessionLocal() as db:
+        conv = await db.get(Conversation, conversation_id)
+        if conv is None or conv.is_group:
+            return
+        peers = await participant_ids(db, conversation_id) - {user_id}
+        if len(peers) != 1:
+            return
+        event = await presence_snapshot_for(db, redis, user_id, next(iter(peers)))
+    await websocket.send_text(json.dumps(event))
+
+
 # ── Endpoint ──────────────────────────────────────────────────────────────────
 
 @router.websocket("/ws/{conversation_id}")
@@ -516,6 +538,7 @@ async def websocket_endpoint(
     websocket: WebSocket,
     conversation_id: UUID,
     token: str = Query(..., description="JWT access token"),
+    presence: bool = Query(False, description="Opt in to peer presence events"),
 ) -> None:
     """
     Per-conversation WebSocket. Inbound frames are dispatched on the top-level
@@ -537,8 +560,16 @@ async def websocket_endpoint(
     user_id_str = str(user_id)
 
     redis: aioredis.Redis = websocket.app.state.redis
-    await manager.connect(websocket, conv_id_str, user_id_str)
+    await manager.connect(websocket, conv_id_str, user_id_str, wants_presence=presence)
     throttle = ConnectionThrottle(settings.WS_CONV_EVENTS_PER_10S, 10.0)
+
+    if presence:
+        # Opted-in (new) clients get the peer's current state immediately;
+        # live changes follow on the conversation channel.
+        try:
+            await _send_presence_snapshot(websocket, redis, conversation_id, user_id)
+        except Exception:
+            logger.exception("presence snapshot failed conv=%s", conv_id_str)
 
     try:
         while True:
