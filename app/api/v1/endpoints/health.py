@@ -12,6 +12,12 @@ from fastapi import APIRouter
 from app.core.config import settings
 from app.schemas.common import HealthResponse
 
+
+def enabled_features() -> list[str]:
+    """Capability flags advertised to clients (see HealthResponse.features)."""
+    features = ["video"]
+    return features
+
 router = APIRouter()
 
 
@@ -26,4 +32,4 @@ async def health_check() -> HealthResponse:
     Returns the service health status.
     Used by AWS ALB / Route53 health checks.
     """
-    return HealthResponse(status="ok", version="1.0.0")
+    return HealthResponse(status="ok", version="1.0.0", features=enabled_features())

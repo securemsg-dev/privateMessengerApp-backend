@@ -26,6 +26,10 @@ class MessageType(str, enum.Enum):
     voice = "voice"
     image = "image"
     document = "document"
+    video = "video"
+    # Server-authored group events ("Alice added Bob"). Payload is plaintext
+    # JSON, never accepted from clients.
+    system = "system"
 
 
 class MessageMetadata(UUIDPrimaryKeyMixin, TimestampMixin, Base):

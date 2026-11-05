@@ -11,15 +11,26 @@ Participants are tracked via ConversationParticipant (many-to-many).
 """
 
 import uuid
+from datetime import datetime, timezone
 
-from sqlalchemy import Boolean, Column, ForeignKey, Index, String, Table
+from sqlalchemy import (
+    Boolean, CheckConstraint, Column, DateTime, ForeignKey, Index, String, Table, func,
+)
 from sqlalchemy.dialects.postgresql import UUID
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
 from app.db.base import Base, TimestampMixin, UUIDPrimaryKeyMixin
 
 
-# Association table — no extra columns needed at this stage
+PARTICIPANT_ROLES = ("admin", "member")
+
+
+def _utcnow() -> datetime:
+    return datetime.now(timezone.utc)
+
+
+# Association table. role/joined_at/last_read_at exist for group chats; for
+# 1:1 chats they're inert (role stays 'member', no code reads the rest).
 conversation_participants = Table(
     "conversation_participants",
     Base.metadata,
@@ -34,6 +45,18 @@ conversation_participants = Table(
         UUID(as_uuid=True),
         ForeignKey("users.id", ondelete="CASCADE"),
         primary_key=True,
+    ),
+    Column("role", String(16), nullable=False, default="member", server_default="member"),
+    # Python-side default as well as the server default: SQLite (tests)
+    # compares timestamps as text, so they must be written in one format.
+    Column(
+        "joined_at", DateTime(timezone=True), nullable=False,
+        default=_utcnow, server_default=func.now(),
+    ),
+    # Group read watermark: everything at or before this is read by this member.
+    Column("last_read_at", DateTime(timezone=True), nullable=True),
+    CheckConstraint(
+        "role IN ('admin', 'member')", name="ck_conversation_participants_role",
     ),
     # The PK (conversation_id, user_id) can't serve "WHERE user_id = ?" —
     # which is exactly how the chat list, call-signaling authorization, and
@@ -58,6 +81,9 @@ class Conversation(UUIDPrimaryKeyMixin, TimestampMixin, Base):
         comment='Sorted "uuid:uuid" of the two participants for 1:1 chats. '
                 "The unique constraint closes the concurrent-create race. "
                 "Null for groups (and legacy duplicate rows).",
+    )
+    created_by: Mapped[Optional[uuid.UUID]] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("users.id", ondelete="SET NULL"), nullable=True,
     )
 
     # ── Relationships ─────────────────────────────────────────────────────

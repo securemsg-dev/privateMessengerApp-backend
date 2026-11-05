@@ -22,7 +22,12 @@ async def test_health_response_schema(client: AsyncClient):
     """Response matches exact expected schema."""
     response = await client.get("/health")
     data = response.json()
-    assert data == {"status": "ok", "version": "1.0.0"}
+    assert data["status"] == "ok"
+    assert data["version"] == "1.0.0"
+    # Capability flags for clients; video ships with the expand release.
+    assert isinstance(data["features"], list)
+    assert "video" in data["features"]
+    assert set(data) == {"status", "version", "features"}
 
 
 @pytest.mark.asyncio

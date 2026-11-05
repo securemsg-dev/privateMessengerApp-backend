@@ -317,8 +317,24 @@ async def test_ws_send_unknown_message_type(ws_client):
     with ws_client.websocket_connect(f"/ws/{conv_id}?token={token}") as ws:
         ws.send_text(json.dumps({
             "encrypted_payload": "cipher",
-            "message_type": "video",
+            "message_type": "hologram",
             "self_destruct": False,
+        }))
+        resp = json.loads(ws.receive_text())
+        assert resp["type"] == "error"
+        assert "Unknown message_type" in resp["detail"]
+
+
+@pytest.mark.asyncio
+async def test_ws_client_cannot_send_system_messages(ws_client):
+    """`system` rows are server-authored group events; clients can't forge them."""
+    user_id, conv_id = await _setup_user_and_conversation("+60300000016")
+    token = create_access_token(user_id)
+
+    with ws_client.websocket_connect(f"/ws/{conv_id}?token={token}") as ws:
+        ws.send_text(json.dumps({
+            "encrypted_payload": '{"event":"member_added"}',
+            "message_type": "system",
         }))
         resp = json.loads(ws.receive_text())
         assert resp["type"] == "error"

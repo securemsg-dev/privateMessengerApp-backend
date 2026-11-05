@@ -44,6 +44,10 @@ class MediaBlob(UUIDPrimaryKeyMixin, TimestampMixin, Base):
         DateTime(timezone=True), nullable=True,
         comment="Set when bytes are received via PUT. Null = upload pending.",
     )
+    storage: Mapped[str] = mapped_column(
+        String(16), nullable=False, default="local", server_default="local",
+        comment="Which backend holds the bytes: 'local' | 's3'. Fixed at creation.",
+    )
 
     def __repr__(self) -> str:
         return f"<MediaBlob id={self.id} size={self.size_bytes} mime={self.mime!r}>"

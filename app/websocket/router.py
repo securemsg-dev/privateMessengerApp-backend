@@ -153,6 +153,9 @@ async def _handle_message(
     try:
         msg_type = MessageType(message_type_str)
     except ValueError:
+        msg_type = None
+    # `system` rows are server-authored group events — never client-sendable.
+    if msg_type is None or msg_type is MessageType.system:
         await websocket.send_text(
             json.dumps({"type": "error", "detail": f"Unknown message_type: {message_type_str!r}"})
         )

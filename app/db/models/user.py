@@ -10,8 +10,9 @@ delete_password (confirms account-wipe flow).
 """
 
 import uuid
+from datetime import datetime
 
-from sqlalchemy import Boolean, String, Text
+from sqlalchemy import Boolean, DateTime, String, Text, false, true
 from sqlalchemy.dialects.postgresql import UUID
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
@@ -60,6 +61,21 @@ class User(UUIDPrimaryKeyMixin, TimestampMixin, Base):
     is_active: Mapped[bool] = mapped_column(
         Boolean, default=True, nullable=False,
         comment="Soft delete flag",
+    )
+    # ── Presence ──────────────────────────────────────────────────────────
+    last_seen_at: Mapped[Optional[datetime]] = mapped_column(
+        DateTime(timezone=True), nullable=True,
+        comment="Last time the user was active (app in foreground).",
+    )
+    show_online_status: Mapped[bool] = mapped_column(
+        Boolean, default=True, server_default=true(), nullable=False,
+        comment="Privacy toggle: false hides online/last-seen from everyone.",
+    )
+    # ── Groups ────────────────────────────────────────────────────────────
+    supports_groups: Mapped[bool] = mapped_column(
+        Boolean, default=False, server_default=false(), nullable=False,
+        comment="Set once an app build that understands groups lists chats. "
+                "Only such users can be added to a group.",
     )
 
     # ── Relationships ─────────────────────────────────────────────────────

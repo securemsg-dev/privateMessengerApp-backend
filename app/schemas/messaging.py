@@ -17,6 +17,11 @@ from pydantic import BaseModel, Field, field_validator
 
 from app.schemas.auth import validate_private_number
 
+# Every message type a stored row may have. Response models MUST use this —
+# a narrower Literal makes the whole chat list / history 500 the first time a
+# newer type (video, system) is stored.
+MessageTypeLiteral = Literal["text", "voice", "image", "document", "video", "system"]
+
 
 # ── User / profile ─────────────────────────────────────────────────────────────
 
@@ -104,7 +109,7 @@ class ConversationCreateRequest(BaseModel):
 class LastMessagePreview(BaseModel):
     id: UUID
     sender_id: UUID
-    message_type: Literal["text", "voice", "image", "document"]
+    message_type: MessageTypeLiteral
     encrypted_payload: str
     created_at: datetime
     self_destruct: bool
@@ -175,7 +180,7 @@ class MessageReplyPreview(BaseModel):
     """
     id: UUID
     sender_id: UUID
-    message_type: Literal["text", "voice", "image", "document"]
+    message_type: MessageTypeLiteral
     encrypted_payload: str
 
     model_config = {"from_attributes": True}
@@ -198,7 +203,7 @@ class MessageResponse(BaseModel):
     id: UUID
     conversation_id: UUID
     sender_id: UUID
-    message_type: Literal["text", "voice", "image", "document"]
+    message_type: MessageTypeLiteral
     encrypted_payload: str
     created_at: datetime
     delivered_at: Optional[datetime]
