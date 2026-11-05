@@ -38,7 +38,7 @@ async def _make_uploaded_blob(db, owner_id: UUID, storage: LocalFileStorage) -> 
 
 
 async def test_delete_for_everyone_removes_blob(client, db_session, tmp_path):
-    storage = LocalFileStorage(base_path=str(tmp_path), ttl_seconds=600)
+    storage = LocalFileStorage(base_path=str(tmp_path))
     alice = await register_and_login(client)
     bob = await register_and_login(client)
     alice_id = UUID(alice["user"]["id"])
@@ -55,7 +55,7 @@ async def test_delete_for_everyone_removes_blob(client, db_session, tmp_path):
     db_session.add(msg)
     await db_session.flush()
 
-    with patch("app.api.v1.endpoints.messages.get_storage", return_value=storage):
+    with patch("app.api.v1.endpoints.messages.storage_for", return_value=storage):
         resp = await client.post(
             f"/api/v1/messages/{msg.id}/delete",
             json={"scope": "everyone"},
@@ -71,7 +71,7 @@ async def test_delete_for_everyone_removes_blob(client, db_session, tmp_path):
 
 
 async def test_delete_for_me_keeps_blob(client, db_session, tmp_path):
-    storage = LocalFileStorage(base_path=str(tmp_path), ttl_seconds=600)
+    storage = LocalFileStorage(base_path=str(tmp_path))
     alice = await register_and_login(client)
     bob = await register_and_login(client)
     alice_id = UUID(alice["user"]["id"])
@@ -88,7 +88,7 @@ async def test_delete_for_me_keeps_blob(client, db_session, tmp_path):
     db_session.add(msg)
     await db_session.flush()
 
-    with patch("app.api.v1.endpoints.messages.get_storage", return_value=storage):
+    with patch("app.api.v1.endpoints.messages.storage_for", return_value=storage):
         resp = await client.post(
             f"/api/v1/messages/{msg.id}/delete",
             json={"scope": "me"},
@@ -102,7 +102,7 @@ async def test_delete_for_me_keeps_blob(client, db_session, tmp_path):
 
 
 async def test_account_delete_removes_owned_blobs(client, db_session, tmp_path):
-    storage = LocalFileStorage(base_path=str(tmp_path), ttl_seconds=600)
+    storage = LocalFileStorage(base_path=str(tmp_path))
     acct = await register_and_login(client)
     user_id = UUID(acct["user"]["id"])
     blob = await _make_uploaded_blob(db_session, user_id, storage)
@@ -119,7 +119,7 @@ async def test_account_delete_removes_owned_blobs(client, db_session, tmp_path):
     assert login.status_code == 200
     assert login.json()["action"] == "confirm_delete"
 
-    with patch("app.services.auth_service.get_storage", return_value=storage):
+    with patch("app.services.auth_service.storage_for", return_value=storage):
         resp = await client.post(
             "/api/v1/auth/confirm-delete",
             json={"delete_token": login.json()["delete_token"]},

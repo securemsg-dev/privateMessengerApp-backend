@@ -45,7 +45,7 @@ async def _make_user(identifier: str) -> uuid.UUID:
 @pytest.mark.asyncio
 async def test_sweep_removes_abandoned_blobs_and_expired_sessions(tmp_path, db_session):
     user_id = await _make_user("9100000001")
-    storage = LocalFileStorage(base_path=str(tmp_path), ttl_seconds=600)
+    storage = LocalFileStorage(base_path=str(tmp_path))
 
     async with TestSessionLocal() as session:
         # Abandoned: reserved 2 days ago, never uploaded
@@ -89,7 +89,7 @@ async def test_sweep_removes_abandoned_blobs_and_expired_sessions(tmp_path, db_s
     assert await storage.read_bytes(abandoned_id) is not None
 
     with patch("app.services.maintenance.AsyncSessionLocal", TestSessionLocal), \
-         patch("app.services.maintenance.get_storage", return_value=storage):
+         patch("app.services.maintenance.storage_for", return_value=storage):
         blobs_removed, sessions_removed, _, orphans_removed = await sweep_once()
 
     assert blobs_removed == 1
@@ -108,7 +108,7 @@ async def test_sweep_removes_abandoned_blobs_and_expired_sessions(tmp_path, db_s
 async def test_sweep_closes_stale_calls(tmp_path, db_session):
     caller_id = await _make_user("9100000002")
     callee_id = await _make_user("9100000003")
-    storage = LocalFileStorage(base_path=str(tmp_path), ttl_seconds=600)
+    storage = LocalFileStorage(base_path=str(tmp_path))
 
     async with TestSessionLocal() as session:
         # Stale, never answered → missed
@@ -134,7 +134,7 @@ async def test_sweep_closes_stale_calls(tmp_path, db_session):
         ringing_id = ringing.id
 
     with patch("app.services.maintenance.AsyncSessionLocal", TestSessionLocal), \
-         patch("app.services.maintenance.get_storage", return_value=storage):
+         patch("app.services.maintenance.storage_for", return_value=storage):
         _, _, calls_closed, _ = await sweep_once()
 
     assert calls_closed == 2
@@ -158,7 +158,7 @@ async def test_sweep_removes_orphaned_uploaded_blobs(tmp_path, db_session):
     reference are removed (file + row); referenced ones survive."""
     user_id = await _make_user("9100000004")
     peer_id = await _make_user("9100000005")
-    storage = LocalFileStorage(base_path=str(tmp_path), ttl_seconds=600)
+    storage = LocalFileStorage(base_path=str(tmp_path))
     old = _now() - timedelta(days=31)
 
     async with TestSessionLocal() as session:
@@ -191,7 +191,7 @@ async def test_sweep_removes_orphaned_uploaded_blobs(tmp_path, db_session):
     await storage.write_bytes(orphan_id, b"orphan-bytes")
 
     with patch("app.services.maintenance.AsyncSessionLocal", TestSessionLocal), \
-         patch("app.services.maintenance.get_storage", return_value=storage):
+         patch("app.services.maintenance.storage_for", return_value=storage):
         _, _, _, orphans_removed = await sweep_once()
 
     assert orphans_removed == 1

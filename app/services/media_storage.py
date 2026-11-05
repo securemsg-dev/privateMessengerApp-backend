@@ -2,91 +2,108 @@ from __future__ import annotations
 """
 app/services/media_storage.py
 ──────────────────────────────
-Abstract storage backend for E2EE-encrypted media blobs (Phase D).
+Storage backends for E2EE-encrypted media blobs (Phase D).
 
-Two concrete implementations:
+  • LocalFileStorage — files under MEDIA_LOCAL_PATH (a Railway Volume in
+    production), served through the app's GET /media/{id}.
 
-  • LocalFileStorage — writes to MEDIA_LOCAL_PATH on the server's filesystem
-    and serves via the FastAPI app's GET /media/{id} endpoint. Default for
-    development; works with no external infra.
+  • S3Storage — any S3-compatible bucket (Railway Buckets in production).
+    New clients upload/download DIRECTLY with short-lived presigned URLs, so
+    media bytes never pass through the app server. Old app builds still go
+    through PUT/GET /media/{id}; for S3 blobs the app proxies those.
 
-  • S3Storage — stub for production. Uploads to AWS S3 and issues pre-signed
-    PUT/GET URLs so the bytes never flow through this app. Method bodies are
-    placeholders — paste real boto3 code (or any S3-compatible SDK) later.
+Each MediaBlob row records which backend holds its bytes (`storage` column),
+fixed at creation. Callers resolve the backend per blob with
+`storage_for(blob)`; new blobs go to `default_storage()`. Both backends stay
+live, so switching MEDIA_STORAGE_BACKEND never strands existing media.
 
-Pick the active backend with the MEDIA_STORAGE_BACKEND env var (`local` or
-`s3`). All callers go through `get_storage()` so swapping is a one-line
-config change.
-
-The blobs themselves are CIPHERTEXT — the server never holds keys. This
-class deliberately does not know or care about the contents.
+The blobs themselves are CIPHERTEXT — the server never holds keys.
 """
 
 import asyncio
 import logging
-import os
 from abc import ABC, abstractmethod
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from typing import Optional
+from typing import AsyncIterator, Optional
 from uuid import UUID
 
 from app.core.config import settings
 
 logger = logging.getLogger(__name__)
 
+OCTET_STREAM = "application/octet-stream"
+STREAM_CHUNK_BYTES = 256 * 1024
+
+
+def api_media_path(blob_id: UUID) -> str:
+    """App-relative URL of a blob's PUT/GET endpoint (stable forever: it is
+    embedded inside E2EE envelopes that old app builds fetch)."""
+    return f"/api/v1/media/{blob_id}"
+
 
 class StorageBackend(ABC):
-    """All storage backends implement these four operations."""
+    """Operations every backend supports."""
 
-    @abstractmethod
-    async def issue_upload_url(self, blob_id: UUID) -> tuple[str, datetime]:
-        """
-        Return `(upload_url, expires_at)`. The client PUTs raw ciphertext
-        bytes to the URL with `Content-Type: application/octet-stream`.
-        """
-
-    @abstractmethod
-    async def issue_download_url(self, blob_id: UUID) -> str:
-        """Return a short-lived URL the client can GET to fetch ciphertext."""
+    #: Value stored in MediaBlob.storage.
+    name: str = ""
+    #: True when clients can PUT/GET the bucket directly via presigned URLs.
+    supports_direct: bool = False
 
     @abstractmethod
     async def write_bytes(self, blob_id: UUID, data: bytes) -> None:
-        """
-        Persist ciphertext for a blob. For `local`, this is the actual write;
-        for `s3` this is a no-op because the client uploads directly to S3.
-        """
+        """Persist ciphertext received through the app (legacy PUT path)."""
 
     @abstractmethod
     async def read_bytes(self, blob_id: UUID) -> Optional[bytes]:
-        """Return ciphertext, or None if the blob hasn't been uploaded yet."""
+        """Return ciphertext, or None if nothing is stored."""
 
     @abstractmethod
     async def delete_bytes(self, blob_id: UUID) -> None:
-        """Remove stored ciphertext for a blob. No-op if nothing was written."""
+        """Remove stored ciphertext. No-op if nothing was written."""
 
     def local_path(self, blob_id: UUID) -> Optional[Path]:
-        """
-        Filesystem path of the stored blob, or None when the backend doesn't
-        store bytes locally (S3). Lets the download endpoint stream straight
-        from disk (FileResponse) instead of loading whole blobs into memory.
-        """
+        """Filesystem path for streaming with FileResponse, or None."""
         return None
 
+    async def open_stream(self, blob_id: UUID) -> Optional[AsyncIterator[bytes]]:
+        """Chunked reader for proxying a blob to a client, or None if missing."""
+        data = await self.read_bytes(blob_id)
+        if data is None:
+            return None
 
-# ── Local filesystem (default — works out of the box) ────────────────────────
+        async def _one() -> AsyncIterator[bytes]:
+            yield data
+
+        return _one()
+
+    # ── Direct (presigned) access — S3 only ──────────────────────────────
+
+    async def presign_upload(
+        self, blob_id: UUID, size_bytes: int,
+    ) -> tuple[str, dict[str, str], datetime]:
+        """Return (url, headers_client_must_send, expires_at)."""
+        raise NotImplementedError
+
+    async def presign_download(self, blob_id: UUID) -> tuple[str, datetime]:
+        """Return (url, expires_at)."""
+        raise NotImplementedError
+
+    async def object_size(self, blob_id: UUID) -> Optional[int]:
+        """Size of the stored object, or None if it doesn't exist."""
+        raise NotImplementedError
+
+
+# ── Local filesystem ──────────────────────────────────────────────────────────
 
 class LocalFileStorage(StorageBackend):
-    """
-    Stores blobs under MEDIA_LOCAL_PATH/<blob_id>.bin. Upload + download URLs
-    point at our own FastAPI app so the client uses the same auth and base
-    URL as every other request.
-    """
+    """Stores blobs under MEDIA_LOCAL_PATH/<blob_id>.bin."""
 
-    def __init__(self, base_path: str, ttl_seconds: int):
+    name = "local"
+
+    def __init__(self, base_path: str):
         self.base_path = Path(base_path).resolve()
         self.base_path.mkdir(parents=True, exist_ok=True)
-        self.ttl_seconds = ttl_seconds
         logger.info("LocalFileStorage rooted at %s", self.base_path)
 
     def _path(self, blob_id: UUID) -> Path:
@@ -95,16 +112,6 @@ class LocalFileStorage(StorageBackend):
     def local_path(self, blob_id: UUID) -> Optional[Path]:
         path = self._path(blob_id)
         return path if path.exists() else None
-
-    async def issue_upload_url(self, blob_id: UUID) -> tuple[str, datetime]:
-        # The client uploads via PUT /api/v1/media/{blob_id}; the URL is
-        # built by the endpoint layer from the active request, so here we
-        # just return a relative path and let the caller prefix it.
-        expires = datetime.now(timezone.utc) + timedelta(seconds=self.ttl_seconds)
-        return (f"/api/v1/media/{blob_id}", expires)
-
-    async def issue_download_url(self, blob_id: UUID) -> str:
-        return f"/api/v1/media/{blob_id}"
 
     async def write_bytes(self, blob_id: UUID, data: bytes) -> None:
         path = self._path(blob_id)
@@ -115,7 +122,6 @@ class LocalFileStorage(StorageBackend):
             tmp.write_bytes(data)
             tmp.replace(path)
 
-        # Keep blocking file I/O off the event loop.
         await asyncio.to_thread(_write)
 
     async def read_bytes(self, blob_id: UUID) -> Optional[bytes]:
@@ -138,97 +144,226 @@ class LocalFileStorage(StorageBackend):
         await asyncio.to_thread(_delete)
 
 
-# ── S3 (stub — fill in when bucket + creds are ready) ────────────────────────
+# ── S3-compatible bucket ──────────────────────────────────────────────────────
 
 class S3Storage(StorageBackend):
     """
-    Production storage backend backed by AWS S3 (or any S3-compatible API).
-    Method bodies are intentionally TODO — drop in boto3 calls once the
-    bucket + IAM credentials exist. The interface is what matters here:
-    swapping LocalFileStorage → S3Storage requires zero changes outside
-    this file.
+    Any S3-compatible API via boto3 (sync client; network calls run in a
+    thread). Presigning is a local computation — no network round trip.
     """
+
+    name = "s3"
+    supports_direct = True
 
     def __init__(
         self,
+        *,
         bucket: str,
         region: str,
         access_key: str,
         secret_key: str,
-        presign_ttl_seconds: int,
+        endpoint_url: Optional[str] = None,
+        url_style: str = "virtual",
+        upload_ttl_seconds: int = 600,
+        download_ttl_seconds: int = 3600,
+        key_prefix: str = "media/",
     ):
+        import boto3
+        from botocore.config import Config
+
         self.bucket = bucket
-        self.region = region
-        self.access_key = access_key
-        self.secret_key = secret_key
-        self.presign_ttl_seconds = presign_ttl_seconds
-        # TODO: initialise boto3 client here
-        # import boto3
-        # self._s3 = boto3.client(
-        #     "s3",
-        #     region_name=region,
-        #     aws_access_key_id=access_key,
-        #     aws_secret_access_key=secret_key,
-        # )
-        logger.warning(
-            "S3Storage initialised in stub mode — calls will raise. "
-            "Swap in boto3 implementation when AWS credentials are available."
+        self.key_prefix = key_prefix
+        self.upload_ttl_seconds = upload_ttl_seconds
+        self.download_ttl_seconds = download_ttl_seconds
+        self._s3 = boto3.client(
+            "s3",
+            region_name=region or None,
+            endpoint_url=endpoint_url or None,
+            aws_access_key_id=access_key or None,
+            aws_secret_access_key=secret_key or None,
+            config=Config(
+                signature_version="s3v4",
+                s3={"addressing_style": "path" if url_style == "path" else "virtual"},
+                # botocore ≥1.36 adds CRC checksums to every request by
+                # default, which many S3-compatible stores reject. Only send
+                # them when an operation actually requires one.
+                request_checksum_calculation="when_required",
+                response_checksum_validation="when_required",
+                retries={"max_attempts": 3, "mode": "standard"},
+            ),
+        )
+        logger.info(
+            "S3Storage bucket=%s endpoint=%s style=%s",
+            bucket, endpoint_url or "aws", url_style,
         )
 
-    async def issue_upload_url(self, blob_id: UUID) -> tuple[str, datetime]:
-        # TODO: replace with self._s3.generate_presigned_url('put_object', ...)
-        # return that URL + (now + presign_ttl_seconds)
-        raise NotImplementedError(
-            "S3Storage.issue_upload_url — paste boto3 generate_presigned_url here"
-        )
+    def _key(self, blob_id: UUID) -> str:
+        return f"{self.key_prefix}{blob_id}.bin"
 
-    async def issue_download_url(self, blob_id: UUID) -> str:
-        # TODO: self._s3.generate_presigned_url('get_object', ...)
-        raise NotImplementedError(
-            "S3Storage.issue_download_url — paste boto3 generate_presigned_url here"
+    @staticmethod
+    def _is_missing(err: Exception) -> bool:
+        from botocore.exceptions import ClientError
+
+        if not isinstance(err, ClientError):
+            return False
+        code = str(err.response.get("Error", {}).get("Code", ""))
+        return code in {"404", "NoSuchKey", "NotFound"}
+
+    async def presign_upload(
+        self, blob_id: UUID, size_bytes: int,
+    ) -> tuple[str, dict[str, str], datetime]:
+        # ContentType AND ContentLength are signed into the URL, so the client
+        # can only PUT exactly the reserved number of bytes (without it, a
+        # presigned PUT accepts objects up to 5 GB).
+        url = self._s3.generate_presigned_url(
+            "put_object",
+            Params={
+                "Bucket": self.bucket,
+                "Key": self._key(blob_id),
+                "ContentType": OCTET_STREAM,
+                "ContentLength": size_bytes,
+            },
+            ExpiresIn=self.upload_ttl_seconds,
+            HttpMethod="PUT",
         )
+        expires = datetime.now(timezone.utc) + timedelta(seconds=self.upload_ttl_seconds)
+        return url, {"Content-Type": OCTET_STREAM}, expires
+
+    async def presign_download(self, blob_id: UUID) -> tuple[str, datetime]:
+        url = self._s3.generate_presigned_url(
+            "get_object",
+            Params={"Bucket": self.bucket, "Key": self._key(blob_id)},
+            ExpiresIn=self.download_ttl_seconds,
+            HttpMethod="GET",
+        )
+        expires = datetime.now(timezone.utc) + timedelta(seconds=self.download_ttl_seconds)
+        return url, expires
+
+    async def object_size(self, blob_id: UUID) -> Optional[int]:
+        def _head() -> Optional[int]:
+            try:
+                resp = self._s3.head_object(Bucket=self.bucket, Key=self._key(blob_id))
+            except Exception as err:  # noqa: BLE001 — classified below
+                if self._is_missing(err):
+                    return None
+                raise
+            return int(resp["ContentLength"])
+
+        return await asyncio.to_thread(_head)
 
     async def write_bytes(self, blob_id: UUID, data: bytes) -> None:
-        # No-op for S3: the client PUTs directly to the pre-signed URL.
-        # We don't proxy bytes through the app server.
-        return None
+        await asyncio.to_thread(
+            self._s3.put_object,
+            Bucket=self.bucket,
+            Key=self._key(blob_id),
+            Body=data,
+            ContentType=OCTET_STREAM,
+        )
 
     async def read_bytes(self, blob_id: UUID) -> Optional[bytes]:
-        # TODO: self._s3.get_object(...)['Body'].read()
-        raise NotImplementedError(
-            "S3Storage.read_bytes — paste boto3 get_object here"
-        )
+        def _get() -> Optional[bytes]:
+            try:
+                resp = self._s3.get_object(Bucket=self.bucket, Key=self._key(blob_id))
+            except Exception as err:  # noqa: BLE001
+                if self._is_missing(err):
+                    return None
+                raise
+            return resp["Body"].read()
+
+        return await asyncio.to_thread(_get)
+
+    async def open_stream(self, blob_id: UUID) -> Optional[AsyncIterator[bytes]]:
+        from starlette.concurrency import iterate_in_threadpool
+
+        def _get():
+            try:
+                return self._s3.get_object(Bucket=self.bucket, Key=self._key(blob_id))
+            except Exception as err:  # noqa: BLE001
+                if self._is_missing(err):
+                    return None
+                raise
+
+        resp = await asyncio.to_thread(_get)
+        if resp is None:
+            return None
+        body = resp["Body"]
+
+        async def _chunks() -> AsyncIterator[bytes]:
+            try:
+                async for chunk in iterate_in_threadpool(
+                    body.iter_chunks(chunk_size=STREAM_CHUNK_BYTES)
+                ):
+                    yield chunk
+            finally:
+                body.close()
+
+        return _chunks()
 
     async def delete_bytes(self, blob_id: UUID) -> None:
-        # TODO: self._s3.delete_object(Bucket=self.bucket, Key=...)
-        raise NotImplementedError(
-            "S3Storage.delete_bytes — paste boto3 delete_object here"
-        )
+        def _delete() -> None:
+            try:
+                self._s3.delete_object(Bucket=self.bucket, Key=self._key(blob_id))
+            except Exception as err:  # noqa: BLE001
+                if not self._is_missing(err):
+                    raise
+
+        await asyncio.to_thread(_delete)
 
 
 # ── Factory ──────────────────────────────────────────────────────────────────
 
-_storage: Optional[StorageBackend] = None
+_backends: dict[str, StorageBackend] = {}
 
 
-def get_storage() -> StorageBackend:
-    """Lazily build the configured backend on first call; cache the instance."""
-    global _storage
-    if _storage is not None:
-        return _storage
+def s3_configured() -> bool:
+    return bool(
+        settings.AWS_S3_BUCKET_NAME
+        and settings.AWS_ACCESS_KEY_ID
+        and settings.AWS_SECRET_ACCESS_KEY
+    )
 
-    if settings.MEDIA_STORAGE_BACKEND == "s3":
-        # S3Storage is still a stub — fail loudly at startup rather than on
-        # the first media request in production. Remove this guard once the
-        # boto3 methods below are implemented.
-        raise RuntimeError(
-            "MEDIA_STORAGE_BACKEND=s3 is not supported yet: S3Storage is a "
-            "stub (methods raise NotImplementedError). Use MEDIA_STORAGE_BACKEND=local "
-            "with a persistent volume, or implement S3Storage first."
+
+def get_backend(name: str) -> StorageBackend:
+    """Backend by name ('local' | 's3'); built once and cached."""
+    backend = _backends.get(name)
+    if backend is not None:
+        return backend
+
+    if name == "s3":
+        if not s3_configured():
+            raise RuntimeError(
+                "S3 media storage requested but AWS_S3_BUCKET_NAME / "
+                "AWS_ACCESS_KEY_ID / AWS_SECRET_ACCESS_KEY are not all set."
+            )
+        backend = S3Storage(
+            bucket=settings.AWS_S3_BUCKET_NAME,
+            region=settings.s3_region,
+            access_key=settings.AWS_ACCESS_KEY_ID,
+            secret_key=settings.AWS_SECRET_ACCESS_KEY,
+            endpoint_url=settings.AWS_ENDPOINT_URL or None,
+            url_style=settings.AWS_S3_URL_STYLE,
+            upload_ttl_seconds=settings.MEDIA_UPLOAD_URL_TTL_SECONDS,
+            download_ttl_seconds=settings.AWS_S3_PRESIGN_EXPIRY_SECONDS,
         )
+    elif name == "local":
+        backend = LocalFileStorage(base_path=settings.MEDIA_LOCAL_PATH)
     else:
-        _storage = LocalFileStorage(
-            base_path=settings.MEDIA_LOCAL_PATH,
-            ttl_seconds=settings.MEDIA_UPLOAD_URL_TTL_SECONDS,
-        )
-    return _storage
+        raise RuntimeError(f"Unknown media storage backend {name!r}")
+
+    _backends[name] = backend
+    return backend
+
+
+def default_storage() -> StorageBackend:
+    """Backend that new blobs are written to (MEDIA_STORAGE_BACKEND)."""
+    return get_backend(settings.MEDIA_STORAGE_BACKEND)
+
+
+def storage_for(blob) -> StorageBackend:
+    """Backend holding an existing blob's bytes (its `storage` column)."""
+    return get_backend(getattr(blob, "storage", None) or "local")
+
+
+def reset_backends() -> None:
+    """Drop cached backends (tests)."""
+    _backends.clear()

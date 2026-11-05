@@ -16,6 +16,8 @@ from app.schemas.common import HealthResponse
 def enabled_features() -> list[str]:
     """Capability flags advertised to clients (see HealthResponse.features)."""
     features = ["video"]
+    if settings.MEDIA_STORAGE_BACKEND == "s3":
+        features.append("direct_upload")
     return features
 
 router = APIRouter()

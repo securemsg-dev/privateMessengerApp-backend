@@ -86,19 +86,29 @@ class Settings(BaseSettings):
     # and nothing else. Short-lived so a leaked token has minimal blast radius.
     DELETE_INTENT_TOKEN_EXPIRE_MINUTES: int = 5
 
-    # ── AWS (S3 media backend — unused until S3Storage is implemented) ───
-    AWS_REGION: str = "ap-southeast-1"
+    # ── S3-compatible media bucket (Railway Buckets in production) ───────
+    # Railway's bucket credentials use these exact variable names.
+    AWS_ENDPOINT_URL: str = ""          # empty = real AWS
+    AWS_DEFAULT_REGION: str = ""        # Railway's name for the region
+    AWS_REGION: str = "ap-southeast-1"  # fallback when AWS_DEFAULT_REGION is unset
     AWS_ACCESS_KEY_ID: str = ""
     AWS_SECRET_ACCESS_KEY: str = ""
-
-    # ── AWS S3 ───────────────────────────────────────────────────────────
-    AWS_S3_BUCKET_NAME: str = "private-messenger-media"
+    AWS_S3_BUCKET_NAME: str = ""
+    # "path" (https://host/bucket/key) or "virtual" (https://bucket.host/key).
+    # Must match the bucket's urlStyle or signatures won't verify.
+    AWS_S3_URL_STYLE: Literal["path", "virtual"] = "virtual"
+    # Lifetime of presigned download URLs handed to clients.
     AWS_S3_PRESIGN_EXPIRY_SECONDS: int = 3600
 
+    @property
+    def s3_region(self) -> str:
+        return self.AWS_DEFAULT_REGION or self.AWS_REGION
+
     # ── Media storage (Phase D) ──────────────────────────────────────────
-    # `local` writes encrypted blobs to MEDIA_LOCAL_PATH and serves them via
-    # the FastAPI app — works out of the box for dev. `s3` uses the AWS_S3_*
-    # settings above (requires boto3 + valid credentials).
+    # Backend for NEW blobs. `local` writes to MEDIA_LOCAL_PATH and serves via
+    # the app; `s3` uses the bucket above with presigned direct uploads.
+    # Existing blobs keep the backend recorded on their row, so flipping this
+    # never strands old media (the local path must stay mounted for them).
     MEDIA_STORAGE_BACKEND: Literal["local", "s3"] = "local"
     MEDIA_LOCAL_PATH: str = "./uploads"
     # Hard cap to keep disk + memory usage sane. 50 MB covers short videos.

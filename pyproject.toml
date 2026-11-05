@@ -44,6 +44,7 @@ dev = [
     "pytest-asyncio>=0.23.0",
     "aiosqlite>=0.20.0",     # In-memory SQLite for tests
     "fakeredis>=2.20.0",     # In-memory Redis for tests
+    "moto[s3]>=5.0.0",       # In-process S3 for media storage tests
     "pytest-cov>=5.0.0",
     "ruff>=0.4.0",           # Linter + formatter
     "mypy>=1.10.0",

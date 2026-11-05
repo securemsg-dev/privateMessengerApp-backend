@@ -29,7 +29,7 @@ from app.db.models.message import MessageMetadata
 from app.db.models.session import Session
 from app.db.models.user import User
 from app.db.session import AsyncSessionLocal
-from app.services.media_storage import get_storage
+from app.services.media_storage import storage_for
 
 logger = logging.getLogger(__name__)
 
@@ -49,7 +49,6 @@ async def sweep_once() -> tuple[int, int, int, int]:
     Returns (blobs_removed, sessions_removed, calls_closed, orphans_removed).
     """
     now = datetime.now(timezone.utc)
-    storage = get_storage()
 
     async with AsyncSessionLocal() as db:
         # ── Abandoned media blobs ────────────────────────────────────────
@@ -62,7 +61,7 @@ async def sweep_once() -> tuple[int, int, int, int]:
         )).scalars().all()
 
         for blob in abandoned:
-            await storage.delete_bytes(blob.id)
+            await storage_for(blob).delete_bytes(blob.id)
             await db.delete(blob)
 
         # ── Orphaned uploaded blobs ──────────────────────────────────────
@@ -96,7 +95,7 @@ async def sweep_once() -> tuple[int, int, int, int]:
             for blob in candidates:
                 if blob.id in referenced or str(blob.id) in avatar_keys:
                     continue
-                await storage.delete_bytes(blob.id)
+                await storage_for(blob).delete_bytes(blob.id)
                 await db.delete(blob)
                 orphans_removed += 1
 

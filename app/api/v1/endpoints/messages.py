@@ -26,7 +26,7 @@ from app.db.models.media_blob import MediaBlob
 from app.db.models.message import MessageMetadata
 from app.db.models.starred_message import StarredMessage
 from app.schemas.messaging import DeleteMessageRequest, StarMessageRequest
-from app.services.media_storage import get_storage
+from app.services.media_storage import storage_for
 from app.websocket.manager import manager
 
 # How long after sending a message you can still wipe it for everyone.
@@ -170,7 +170,7 @@ async def delete_message(
         # fully wiped on every backend, SQLite included.
         msg.media_blob_id = None
         if blob is not None:
-            await get_storage().delete_bytes(blob.id)
+            await storage_for(blob).delete_bytes(blob.id)
             await db.delete(blob)
     await db.flush()
 

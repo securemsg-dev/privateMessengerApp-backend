@@ -234,16 +234,47 @@ class MediaUploadRequest(BaseModel):
     """
     size_bytes: int = Field(gt=0)
     mime: str = Field(min_length=1, max_length=128)
+    # New clients ask for a presigned direct-to-bucket upload. Old builds omit
+    # it and keep PUTting through the app. The server decides — clients must
+    # branch on the response's `upload_method`, not on what they asked for.
+    direct: bool = False
 
 
 class MediaUploadResponse(BaseModel):
-    """Issued upload coordinates. `download_url` is what the *recipient*
-    hits later to fetch the ciphertext (after the sender finishes PUTting)."""
+    """Issued upload coordinates.
+
+    upload_method="api":    PUT the bytes to upload_url WITH the Bearer token.
+    upload_method="direct": PUT to the presigned upload_url with exactly
+                            `upload_headers` and NO Authorization header, then
+                            POST /media/{blob_id}/complete.
+
+    `download_url` is always the app's own GET /media/{id} path: it gets
+    embedded in E2EE envelopes, so it must stay valid (and auth-compatible)
+    for every app build, forever."""
     blob_id: UUID
     upload_url: str
     download_url: str
     expires_at: datetime
     max_bytes: int
+    upload_method: Literal["api", "direct"] = "api"
+    upload_headers: dict[str, str] = Field(default_factory=dict)
+
+
+class MediaDownloadUrlsRequest(BaseModel):
+    blob_ids: list[UUID] = Field(min_length=1, max_length=100)
+
+
+class MediaDownloadUrl(BaseModel):
+    url: str
+    # True → send the Bearer token (app-served blob). False → presigned
+    # bucket URL; an Authorization header would make the bucket reject it.
+    auth: bool
+    expires_at: Optional[datetime] = None
+
+
+class MediaDownloadUrlsResponse(BaseModel):
+    """Keyed by blob id. Unknown / not-yet-uploaded blobs are omitted."""
+    urls: dict[str, MediaDownloadUrl]
 
 
 # ── WebRTC (Phase E) ──────────────────────────────────────────────────────────

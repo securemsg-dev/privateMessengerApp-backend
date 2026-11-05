@@ -37,7 +37,7 @@ from app.core.config import settings
 from app.core.limiter import limiter
 from app.db.session import engine
 from app.services.maintenance import run_maintenance_loop
-from app.services.media_storage import get_storage
+from app.services.media_storage import default_storage, get_backend
 from app.services.push_service import close_http_client
 from app.websocket.manager import manager
 from app.websocket.router import router as ws_router
@@ -102,9 +102,12 @@ async def lifespan(app: FastAPI):
     # ── Startup ───────────────────────────────────────────────────────────
     logger.info("Starting %s [%s]", settings.APP_NAME, settings.APP_ENV)
 
-    # Fail fast if the configured media backend is unusable (e.g. the S3
-    # stub) instead of erroring on the first upload in production.
-    get_storage()
+    # Fail fast if the configured media backend is unusable (e.g. s3 selected
+    # without credentials) instead of erroring on the first upload. The local
+    # backend is always built too: blobs stored before a switch to s3 still
+    # live on the volume.
+    default_storage()
+    get_backend("local")
 
     # Connect to Redis. health_check_interval proactively re-validates
     # long-idle pooled connections instead of failing the first publish
