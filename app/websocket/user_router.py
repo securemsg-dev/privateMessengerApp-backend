@@ -36,7 +36,7 @@ from sqlalchemy import and_, exists, select
 
 from app.core.config import settings
 from app.core.security import verify_access_token
-from app.db.models.conversation import conversation_participants
+from app.db.models.conversation import Conversation, conversation_participants
 from app.db.models.user import User
 from app.db.session import AsyncSessionLocal
 from app.services.moderation_service import blocks_exist_between
@@ -98,9 +98,16 @@ async def _share_a_conversation(user_a: UUID, user_b: UUID) -> bool:
     if cached is not None:
         return cached
     async with AsyncSessionLocal() as db:
-        # Conversations where user_a is a participant
-        a_convs = select(conversation_participants.c.conversation_id).where(
-            conversation_participants.c.user_id == user_a,
+        # 1:1 conversations where user_a is a participant. Sharing a GROUP is
+        # deliberately not enough: being in a group with someone must not
+        # let you ring them.
+        a_convs = (
+            select(conversation_participants.c.conversation_id)
+            .join(Conversation, Conversation.id == conversation_participants.c.conversation_id)
+            .where(
+                conversation_participants.c.user_id == user_a,
+                Conversation.is_group.is_(False),
+            )
         )
         # Does user_b appear in any of those?
         result = await db.execute(

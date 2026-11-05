@@ -211,6 +211,11 @@ async def delete_user_by_id(user_id: UUID, db: AsyncSession) -> None:
     if user is None:
         logger.info("delete_user_by_id: user already gone | user_id=%s", user_id)
         return
+
+    # Leave groups through the group service first: a bare FK cascade would
+    # skip admin hand-over and leave empty groups behind.
+    from app.services.group_service import leave_all_groups_for_deleted_account
+    await leave_all_groups_for_deleted_account(db, user)
     logger.info(
         "Deleting account: user_id=%s private_number=******%s",
         user.id,

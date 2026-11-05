@@ -22,7 +22,7 @@ from sqlalchemy import or_, select
 from app.core.dependencies import CurrentUser, DBSession
 from app.core.limiter import limiter
 from app.db.models.call import Call
-from app.db.models.conversation import conversation_participants
+from app.db.models.conversation import Conversation, conversation_participants
 from app.db.models.user import User
 from app.services.moderation_service import blocks_exist_between
 from app.schemas.messaging import (
@@ -51,6 +51,15 @@ async def create_call(
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
             detail="Cannot call yourself",
+        )
+
+    # Calls are 1:1 only — group calling isn't supported yet, and a group
+    # that happens to have two members left is still a group.
+    conv = await db.get(Conversation, body.conversation_id)
+    if conv is None or conv.is_group:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Calls are only available in one-to-one chats",
         )
 
     # Both parties must be participants of the conversation

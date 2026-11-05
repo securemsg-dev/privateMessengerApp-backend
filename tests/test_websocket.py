@@ -185,6 +185,14 @@ def _assert_closed_1008(ws) -> None:
     assert exc_info.value.code == 1008
 
 
+def _assert_closed_4403(ws) -> None:
+    """Not a participant: 4403 is final — clients must not reconnect (a 1008
+    would trigger their token-refresh-and-retry loop)."""
+    with pytest.raises(WebSocketDisconnect) as exc_info:
+        ws.receive_text()
+    assert exc_info.value.code == 4403
+
+
 @pytest.mark.asyncio
 async def test_ws_invalid_token(ws_client):
     """Connecting with an invalid JWT should close with 1008."""
@@ -213,18 +221,18 @@ async def test_ws_user_not_participant(ws_client):
 
     token = create_access_token(user_a_id)
     with ws_client.websocket_connect(f"/ws/{conv_id}?token={token}") as ws:
-        _assert_closed_1008(ws)
+        _assert_closed_4403(ws)
 
 
 @pytest.mark.asyncio
 async def test_ws_nonexistent_conversation(ws_client):
-    """Connecting to a non-existent conversation should close with 1008."""
+    """Connecting to a non-existent conversation closes with 4403 (not a member)."""
     user_id = await _setup_user_only("+60300000003")
     token = create_access_token(user_id)
     fake_conv_id = uuid.uuid4()
 
     with ws_client.websocket_connect(f"/ws/{fake_conv_id}?token={token}") as ws:
-        _assert_closed_1008(ws)
+        _assert_closed_4403(ws)
 
 
 @pytest.mark.asyncio

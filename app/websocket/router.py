@@ -40,13 +40,14 @@ Outbound (server → client) events follow the same shape but always include
 import asyncio
 import json
 import logging
+from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Optional
 from uuid import UUID, uuid4
 
 from fastapi import APIRouter, Query, WebSocket, WebSocketDisconnect, status
 from jose import JWTError
-from sqlalchemy import select
+from sqlalchemy import func, or_, select, update
 
 from app.core.config import settings
 from app.core.security import verify_access_token
@@ -59,7 +60,7 @@ from app.db.session import AsyncSessionLocal
 from app.services.moderation_service import participant_ids, recipients_blocking
 from app.services.presence import snapshot_for as presence_snapshot_for
 from app.services.push_service import send_push_to_users
-from app.websocket.manager import manager
+from app.websocket.manager import REMOVED_CLOSE_CODE, manager
 from app.websocket.throttle import ConnectionThrottle
 
 import redis.asyncio as aioredis
@@ -89,8 +90,18 @@ async def _authenticate_websocket(token: str) -> UUID:
         raise WebSocketDisconnect(code=status.WS_1008_POLICY_VIOLATION)
 
 
-async def _authorize_conversation(user_id: UUID, conversation_id: UUID) -> None:
-    """Verify the user is a participant of the conversation."""
+@dataclass(frozen=True)
+class ConnContext:
+    """Per-connection facts loaded once at connect (not per message)."""
+    is_group: bool = False
+    #: Group messages carry the sender's name + key so recipients can label
+    #: and decrypt them without a member lookup.
+    sender_name: Optional[str] = None
+    sender_public_key: Optional[str] = None
+
+
+async def _authorize_conversation(user_id: UUID, conversation_id: UUID) -> ConnContext:
+    """Verify the user is a participant; 4403 if not (final, unlike 1008)."""
     async with AsyncSessionLocal() as db:
         result = await db.execute(
             select(conversation_participants).where(
@@ -99,7 +110,46 @@ async def _authorize_conversation(user_id: UUID, conversation_id: UUID) -> None:
             )
         )
         if not result.first():
-            raise WebSocketDisconnect(code=status.WS_1008_POLICY_VIOLATION)
+            raise WebSocketDisconnect(code=REMOVED_CLOSE_CODE)
+        conv = await db.get(Conversation, conversation_id)
+        if conv is None or not conv.is_group:
+            return ConnContext()
+        me = await db.get(User, user_id)
+        return ConnContext(
+            is_group=True,
+            sender_name=me.display_name if me else None,
+            sender_public_key=me.public_key if me else None,
+        )
+
+
+async def _send_error(
+    websocket: WebSocket,
+    detail: str,
+    *,
+    client_temp_id: Optional[str] = None,
+    code: Optional[str] = None,
+) -> None:
+    """Error frame. `client_temp_id` lets the sender mark that message failed."""
+    frame: dict = {"type": "error", "detail": detail}
+    if client_temp_id:
+        frame["client_temp_id"] = client_temp_id
+    if code:
+        frame["code"] = code
+    await websocket.send_text(json.dumps(frame))
+
+
+def _group_envelope_recipients(payload: str) -> Optional[set[str]]:
+    """User ids a v2 group envelope wrapped the message key for, or None."""
+    try:
+        env = json.loads(payload)
+    except (ValueError, TypeError):
+        return None
+    if not isinstance(env, dict) or env.get("v") != 2:
+        return None
+    keys = env.get("k")
+    if not isinstance(keys, dict) or not keys:
+        return None
+    return set(keys.keys())
 
 
 # ── Event handlers ────────────────────────────────────────────────────────────
@@ -112,19 +162,24 @@ async def _handle_message(
     user_id: UUID,
     user_id_str: str,
     data: dict,
+    ctx: ConnContext = ConnContext(),
 ) -> None:
     """Persist + publish a new chat message."""
+    # Optional client-supplied dedupe id; echoed in the published event so
+    # the sender's optimistic UI can match it to the persisted message (and
+    # in error frames, so it can mark exactly that message as failed).
+    raw_temp = data.get("client_temp_id")
+    client_temp_id: Optional[str] = raw_temp if isinstance(raw_temp, str) and len(raw_temp) <= 64 else None
+
+    async def fail(detail: str, code: Optional[str] = None) -> None:
+        await _send_error(websocket, detail, client_temp_id=client_temp_id, code=code)
+
     encrypted_payload = data.get("encrypted_payload", "")
     if not isinstance(encrypted_payload, str):
-        await websocket.send_text(
-            json.dumps({"type": "error", "detail": "encrypted_payload must be a string"})
-        )
+        await fail("encrypted_payload must be a string")
         return
     message_type_str = data.get("message_type", "text")
     self_destruct: bool = bool(data.get("self_destruct", False))
-    # Optional client-supplied dedupe id; echoed in the published event so
-    # the sender's optimistic UI can match it to the persisted message.
-    client_temp_id: Optional[str] = data.get("client_temp_id")
     # Phase C.2 — inline reply target. Null/missing = standalone message.
     raw_reply_to = data.get("reply_to_id")
     reply_to_id: Optional[UUID] = None
@@ -132,9 +187,7 @@ async def _handle_message(
         try:
             reply_to_id = UUID(raw_reply_to)
         except (ValueError, TypeError):
-            await websocket.send_text(
-                json.dumps({"type": "error", "detail": "Invalid reply_to_id"})
-            )
+            await fail("Invalid reply_to_id")
             return
 
     # Optional plaintext blob reference for media messages — enables storage
@@ -146,9 +199,7 @@ async def _handle_message(
         try:
             media_blob_id = UUID(raw_media_blob)
         except (ValueError, TypeError):
-            await websocket.send_text(
-                json.dumps({"type": "error", "detail": "Invalid media_blob_id"})
-            )
+            await fail("Invalid media_blob_id")
             return
 
     try:
@@ -157,12 +208,25 @@ async def _handle_message(
         msg_type = None
     # `system` rows are server-authored group events — never client-sendable.
     if msg_type is None or msg_type is MessageType.system:
-        await websocket.send_text(
-            json.dumps({"type": "error", "detail": f"Unknown message_type: {message_type_str!r}"})
-        )
+        await fail(f"Unknown message_type: {message_type_str!r}")
         return
 
     async with AsyncSessionLocal() as db:
+        # Membership is re-checked on every send: a member removed from a
+        # group may still hold an open socket for a moment.
+        members = await participant_ids(db, conversation_id)
+        if user_id not in members:
+            await fail("You are no longer a member of this conversation", code="not_a_member")
+            return
+        if ctx.is_group:
+            # E2EE groups: the message key must be wrapped for EXACTLY the
+            # current members — no one missing (they couldn't read it), no
+            # one extra (removed members). A stale member list on the client
+            # gets this error and re-encrypts.
+            if _group_envelope_recipients(encrypted_payload) != {str(m) for m in members}:
+                await fail("Group members changed — re-encrypt and resend", code="group_members_changed")
+                return
+
         # If replying, verify the target lives in THIS conversation — stops
         # clients from cross-stitching threads they shouldn't have access to.
         if reply_to_id is not None:
@@ -173,9 +237,10 @@ async def _handle_message(
                 )
             )).scalar_one_or_none()
             if target is None:
-                await websocket.send_text(
-                    json.dumps({"type": "error", "detail": "reply_to_id not in this conversation"})
-                )
+                await fail("reply_to_id not in this conversation")
+                return
+            if target.message_type == MessageType.system:
+                await fail("Can't reply to this message")
                 return
 
         # Blob reference must belong to the sender and have its bytes uploaded
@@ -190,16 +255,14 @@ async def _handle_message(
                 )
             )).scalar_one_or_none()
             if blob is None:
-                await websocket.send_text(
-                    json.dumps({"type": "error", "detail": "media_blob_id not found"})
-                )
+                await fail("media_blob_id not found")
                 return
 
         # ── Block enforcement (Google Play UGC policy) ────────────────────
         # Checked at SEND time, not read time: a message nobody is allowed to
         # receive is never written, so it cannot resurface later through
         # history pagination or an unblock.
-        others = await participant_ids(db, conversation_id) - {user_id}
+        others = members - {user_id}
         blockers = await recipients_blocking(db, conversation_id, user_id)
         fully_blocked = bool(others) and others <= blockers
 
@@ -250,6 +313,9 @@ async def _handle_message(
         "reply_to_id": str(reply_to_id) if reply_to_id else None,
         "timestamp": msg.created_at.isoformat(),
     }
+    if ctx.is_group:
+        event["sender_display_name"] = ctx.sender_name
+        event["sender_public_key"] = ctx.sender_public_key
     # Group case: some members blocked the sender but others didn't, so the
     # message is stored and delivered — just not to the blockers. The manager
     # strips this key before it reaches any socket.
@@ -303,6 +369,9 @@ async def _notify_new_message(
             sender = await db.get(User, sender_id)
             sender_name = (sender.display_name or "Cricchat") if sender else "Cricchat"
             sender_private_number = sender.private_number if sender else ""
+            conv = await db.get(Conversation, conversation_id)
+            is_group = bool(conv and conv.is_group)
+            group_name = (conv.name or "Group") if is_group else None
 
             in_conversation = set(manager._conv_connections.get(conv_id_str, {}).keys())
 
@@ -313,8 +382,12 @@ async def _notify_new_message(
                 **event,
                 "type": "message_notification",
                 "sender_name": sender_name,
-                "sender_private_number": sender_private_number,
+                # Groups never reveal a member's private number.
+                "sender_private_number": "" if is_group else sender_private_number,
             }
+            if is_group:
+                notification["is_group"] = True
+                notification["conversation_name"] = group_name
             notification.pop("_skip_user_ids", None)  # server-internal routing hint
 
             offline_ids: list[UUID] = []
@@ -330,17 +403,25 @@ async def _notify_new_message(
                     offline_ids.append(uid)
 
             if offline_ids:
-                await send_push_to_users(
-                    user_ids=offline_ids,
-                    title=sender_name,
-                    body="New message",
-                    data={
+                if is_group:
+                    title, body = group_name, f"{sender_name}: New message"
+                    data = {
+                        "conversation_id": str(conversation_id),
+                        "message_id": str(message_id),
+                        "contact_name": group_name,
+                        "contact_private_number": "",
+                        "is_group": True,
+                    }
+                else:
+                    title, body = sender_name, "New message"
+                    data = {
                         "conversation_id": str(conversation_id),
                         "message_id": str(message_id),
                         "contact_name": sender_name,
                         "contact_private_number": sender_private_number,
-                    },
-                    db=db,
+                    }
+                await send_push_to_users(
+                    user_ids=offline_ids, title=title, body=body, data=data, db=db,
                 )
     except Exception:
         logger.exception("[push] Failed to notify on new message")
@@ -354,6 +435,7 @@ async def _handle_reaction(
     user_id: UUID,
     user_id_str: str,
     data: dict,
+    ctx: ConnContext = ConnContext(),
 ) -> None:
     """
     Toggle (add/remove) a single emoji reaction by the calling user on a
@@ -393,6 +475,12 @@ async def _handle_reaction(
             await websocket.send_text(
                 json.dumps({"type": "error", "detail": "Message not in this conversation"})
             )
+            return
+        if target.message_type == MessageType.system:
+            await _send_error(websocket, "Can't react to this message")
+            return
+        if ctx.is_group and user_id not in await participant_ids(db, conversation_id):
+            await _send_error(websocket, "You are no longer a member", code="not_a_member")
             return
 
         existing = (await db.execute(
@@ -439,6 +527,7 @@ async def _handle_receipt(
     user_id_str: str,
     kind: str,  # "delivery" | "read"
     data: dict,
+    ctx: ConnContext = ConnContext(),
 ) -> None:
     """Mark one or more messages delivered/read and notify peers via Redis.
 
@@ -465,6 +554,10 @@ async def _handle_receipt(
         await websocket.send_text(
             json.dumps({"type": "error", "detail": "Invalid message_id"})
         )
+        return
+
+    if ctx.is_group:
+        await _handle_group_read(redis, conversation_id, conv_id_str, user_id, user_id_str, kind, message_ids)
         return
 
     async with AsyncSessionLocal() as db:
@@ -531,6 +624,57 @@ async def _send_presence_snapshot(
     await websocket.send_text(json.dumps(event))
 
 
+async def _handle_group_read(
+    redis: aioredis.Redis,
+    conversation_id: UUID,
+    conv_id_str: str,
+    user_id: UUID,
+    user_id_str: str,
+    kind: str,
+    message_ids: list[UUID],
+) -> None:
+    """
+    Groups track reads per member as a watermark (participants.last_read_at)
+    and never touch message-level read_at/delivered_at — those would mark a
+    message read for everyone the moment one member opened it. Delivery
+    receipts aren't tracked in groups.
+    """
+    if kind != "read":
+        return
+    cp = conversation_participants
+    async with AsyncSessionLocal() as db:
+        newest = (await db.execute(
+            select(func.max(MessageMetadata.created_at)).where(
+                MessageMetadata.id.in_(message_ids),
+                MessageMetadata.conversation_id == conversation_id,
+                MessageMetadata.sender_id != user_id,
+            )
+        )).scalar_one_or_none()
+        if newest is None:
+            return
+        res = await db.execute(
+            update(cp)
+            .where(
+                cp.c.conversation_id == conversation_id,
+                cp.c.user_id == user_id,  # also the membership re-check
+                or_(cp.c.last_read_at.is_(None), cp.c.last_read_at < newest),
+            )
+            .values(last_read_at=newest)
+        )
+        if not res.rowcount:
+            return  # not a member, or the watermark is already past this
+        await db.commit()
+
+    await manager.publish(redis, conv_id_str, {
+        "type": "read",
+        "conversation_id": conv_id_str,
+        "message_id": str(message_ids[0]),
+        "message_ids": [str(i) for i in message_ids],
+        "by_user_id": user_id_str,
+        "timestamp": datetime.now(timezone.utc).isoformat(),
+    })
+
+
 # ── Endpoint ──────────────────────────────────────────────────────────────────
 
 @router.websocket("/ws/{conversation_id}")
@@ -546,14 +690,15 @@ async def websocket_endpoint(
     """
     try:
         user_id = await _authenticate_websocket(token)
-        await _authorize_conversation(user_id, conversation_id)
-    except WebSocketDisconnect:
+        ctx = await _authorize_conversation(user_id, conversation_id)
+    except WebSocketDisconnect as exc:
         # A close code can only reach the client AFTER the handshake is
         # accepted. Rejecting pre-accept surfaces on the client as a generic
         # 1006, so its "1008 → refresh token → reconnect" path never fires
-        # and an expired-token socket just flaps on backoff.
+        # and an expired-token socket just flaps on backoff. 4403 (not a
+        # member) is final — the client must not reconnect.
         await websocket.accept()
-        await websocket.close(code=status.WS_1008_POLICY_VIOLATION)
+        await websocket.close(code=exc.code or status.WS_1008_POLICY_VIOLATION)
         return
 
     conv_id_str = str(conversation_id)
@@ -595,17 +740,17 @@ async def websocket_endpoint(
             if event_type == "message":
                 await _handle_message(
                     websocket, redis, conversation_id, conv_id_str,
-                    user_id, user_id_str, data,
+                    user_id, user_id_str, data, ctx,
                 )
             elif event_type in ("delivery", "read"):
                 await _handle_receipt(
                     websocket, redis, conversation_id, conv_id_str,
-                    user_id, user_id_str, event_type, data,
+                    user_id, user_id_str, event_type, data, ctx,
                 )
             elif event_type == "reaction":
                 await _handle_reaction(
                     websocket, redis, conversation_id, conv_id_str,
-                    user_id, user_id_str, data,
+                    user_id, user_id_str, data, ctx,
                 )
             else:
                 await websocket.send_text(

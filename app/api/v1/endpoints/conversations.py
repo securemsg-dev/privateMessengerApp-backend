@@ -24,15 +24,16 @@ from typing import Optional
 from uuid import UUID
 
 from fastapi import APIRouter, HTTPException, Query, Request, status
-from sqlalchemy import select, func, desc
+from sqlalchemy import and_, desc, func, or_, select
 from sqlalchemy.exc import IntegrityError
 
 from app.core.dependencies import CurrentUser, DBSession
 from app.core.limiter import limiter
+from app.db.models.blocked_user import BlockedUser
 from app.db.models.conversation import Conversation, conversation_participants
 from app.db.models.conversation_pref import ConversationPref
 from app.db.models.deleted_message import DeletedMessage
-from app.db.models.message import MessageMetadata
+from app.db.models.message import MessageMetadata, MessageType
 from app.db.models.message_reaction import MessageReaction
 from app.db.models.starred_message import StarredMessage
 from app.db.models.user import User
@@ -40,6 +41,10 @@ from app.schemas.messaging import (
     ConversationCreateRequest,
     ConversationPrefsUpdate,
     ConversationResponse,
+    GroupCreateRequest,
+    GroupMember,
+    GroupMembersAddRequest,
+    GroupUpdateRequest,
     LastMessagePreview,
     MessagePage,
     MessageReplyPreview,
@@ -47,6 +52,8 @@ from app.schemas.messaging import (
     ReactionAggregate,
     UserPublic,
 )
+from app.services import group_service
+from app.services.group_service import GroupError
 
 # Per-user pin limit for the chat list. Mirrors the frontend's PIN_LIMIT.
 PIN_LIMIT = 5
@@ -64,51 +71,37 @@ async def _ensure_participant(
     db,
     conversation_id: UUID,
     user_id: UUID,
-) -> None:
-    """Raise 403 if the user is not a participant of the given conversation."""
-    result = await db.execute(
+):
+    """Return the caller's participant row; 403 if they aren't a member."""
+    row = (await db.execute(
         select(conversation_participants).where(
             conversation_participants.c.conversation_id == conversation_id,
             conversation_participants.c.user_id == user_id,
         )
-    )
-    if not result.first():
+    )).first()
+    if not row:
         raise HTTPException(
             status_code=status.HTTP_403_FORBIDDEN,
             detail="You are not a participant of this conversation",
         )
+    return row
 
 
-async def _last_message(db, conversation_id: UUID) -> Optional[MessageMetadata]:
-    """Return the most recent message metadata for a conversation, or None."""
-    result = await db.execute(
-        select(MessageMetadata)
-        .where(MessageMetadata.conversation_id == conversation_id)
-        .order_by(MessageMetadata.created_at.desc())
-        .limit(1)
-    )
-    return result.scalar_one_or_none()
+def _blocked_by(user_id: UUID):
+    """Subquery: everyone `user_id` has blocked (hidden from them in groups)."""
+    return select(BlockedUser.blocked_id).where(BlockedUser.blocker_id == user_id)
 
 
-async def _other_participant(
-    db,
-    conversation_id: UUID,
-    current_user_id: UUID,
-) -> Optional[User]:
-    """Return the OTHER participant of a 1:1 conversation, or None for groups."""
-    result = await db.execute(
-        select(User)
-        .join(
-            conversation_participants,
-            conversation_participants.c.user_id == User.id,
-        )
-        .where(
-            conversation_participants.c.conversation_id == conversation_id,
-            User.id != current_user_id,
-        )
-        .limit(1)
-    )
-    return result.scalar_one_or_none()
+def _group_error(err: GroupError) -> HTTPException:
+    return HTTPException(status_code=err.status_code, detail=err.detail)
+
+
+async def _users_by_id(db, user_ids) -> dict[UUID, User]:
+    ids = [u for u in set(user_ids) if u is not None]
+    if not ids:
+        return {}
+    rows = (await db.execute(select(User).where(User.id.in_(ids)))).scalars().all()
+    return {u.id: u for u in rows}
 
 
 async def _load_pref(
@@ -152,9 +145,43 @@ async def _unread_counts_for(
     return {conv_id: int(count) for conv_id, count in rows}
 
 
+async def _group_unread_counts_for(
+    db,
+    conversation_ids: list[UUID],
+    current_user_id: UUID,
+) -> dict[UUID, int]:
+    """
+    Groups use a per-member read watermark (participants.last_read_at), not
+    the message-level read_at — one member reading must not clear the badge
+    for everyone. Unread = other people's messages after my watermark (or my
+    join time), excluding system lines and people I've blocked.
+    """
+    if not conversation_ids:
+        return {}
+    me = conversation_participants
+    rows = (await db.execute(
+        select(MessageMetadata.conversation_id, func.count(MessageMetadata.id))
+        .join(me, and_(
+            me.c.conversation_id == MessageMetadata.conversation_id,
+            me.c.user_id == current_user_id,
+        ))
+        .where(
+            MessageMetadata.conversation_id.in_(conversation_ids),
+            MessageMetadata.sender_id != current_user_id,
+            MessageMetadata.message_type != MessageType.system,
+            MessageMetadata.deleted_at.is_(None),
+            MessageMetadata.created_at > func.coalesce(me.c.last_read_at, me.c.joined_at),
+            MessageMetadata.sender_id.not_in(_blocked_by(current_user_id)),
+        )
+        .group_by(MessageMetadata.conversation_id)
+    )).all()
+    return {conv_id: int(count) for conv_id, count in rows}
+
+
 async def _last_messages_for(
     db,
     conversation_ids: list[UUID],
+    current_user_id: UUID,
 ) -> dict[UUID, MessageMetadata]:
     """
     One query for the newest message of EVERY conversation in the batch.
@@ -171,9 +198,26 @@ async def _last_messages_for(
         )
         .label("rn")
     )
+    me = conversation_participants
     sub = (
         select(MessageMetadata.id.label("mid"), rn)
-        .where(MessageMetadata.conversation_id.in_(conversation_ids))
+        .join(Conversation, Conversation.id == MessageMetadata.conversation_id)
+        .join(me, and_(
+            me.c.conversation_id == MessageMetadata.conversation_id,
+            me.c.user_id == current_user_id,
+        ))
+        .where(
+            MessageMetadata.conversation_id.in_(conversation_ids),
+            # Groups: only what this member may see — nothing from before
+            # they joined (not encrypted for them) or from people they block.
+            or_(
+                Conversation.is_group.is_(False),
+                and_(
+                    MessageMetadata.created_at >= me.c.joined_at,
+                    MessageMetadata.sender_id.not_in(_blocked_by(current_user_id)),
+                ),
+            ),
+        )
         .subquery()
     )
     rows = (await db.execute(
@@ -189,7 +233,7 @@ async def _other_participants_for(
     conversation_ids: list[UUID],
     current_user_id: UUID,
 ) -> dict[UUID, User]:
-    """Batch version of _other_participant — one query for the whole chat list."""
+    """The other participant of each 1:1 conversation (pass 1:1 ids only)."""
     if not conversation_ids:
         return {}
     rows = (await db.execute(
@@ -223,42 +267,111 @@ async def _prefs_for(
     return {p.conversation_id: p for p in rows}
 
 
+async def _group_members_for(
+    db,
+    conversation_ids: list[UUID],
+) -> dict[UUID, list[tuple[str, User]]]:
+    """(role, user) for every member of each group, oldest member first."""
+    if not conversation_ids:
+        return {}
+    cp = conversation_participants
+    rows = (await db.execute(
+        select(cp.c.conversation_id, cp.c.role, User)
+        .join(User, User.id == cp.c.user_id)
+        .where(cp.c.conversation_id.in_(conversation_ids))
+        .order_by(cp.c.joined_at, cp.c.user_id)
+    )).all()
+    out: dict[UUID, list[tuple[str, User]]] = {}
+    for conv_id, role, user in rows:
+        out.setdefault(conv_id, []).append((role, user))
+    return out
+
+
+def _preview(msg: Optional[MessageMetadata], sender: Optional[User], is_group: bool):
+    if msg is None:
+        return None
+    p = LastMessagePreview.model_validate(msg)
+    if is_group and sender is not None:
+        p.sender_display_name = sender.display_name
+        p.sender_public_key = sender.public_key
+    return p
+
+
+async def _build_responses(
+    db,
+    convs: list[Conversation],
+    current_user_id: UUID,
+) -> list[ConversationResponse]:
+    """
+    Hydrate conversations for the chat list (or a single one) in a fixed
+    number of batched queries, whatever the list length — each round trip
+    costs WAN DB latency.
+    """
+    if not convs:
+        return []
+    ids = [c.id for c in convs]
+    group_ids = [c.id for c in convs if c.is_group]
+    direct_ids = [c.id for c in convs if not c.is_group]
+
+    unread_map = await _unread_counts_for(db, direct_ids, current_user_id)
+    unread_map.update(await _group_unread_counts_for(db, group_ids, current_user_id))
+    last_map = await _last_messages_for(db, ids, current_user_id)
+    other_map = await _other_participants_for(db, direct_ids, current_user_id)
+    members_map = await _group_members_for(db, group_ids)
+    pref_map = await _prefs_for(db, ids, current_user_id)
+    group_set = set(group_ids)
+    sender_map = await _users_by_id(
+        db, [m.sender_id for cid, m in last_map.items() if cid in group_set],
+    )
+
+    out: list[ConversationResponse] = []
+    for c in convs:
+        last_msg = last_map.get(c.id)
+        pref = pref_map.get(c.id)
+        participants = None
+        my_role = None
+        other = None
+        if c.is_group:
+            members = members_map.get(c.id, [])
+            participants = [
+                GroupMember(
+                    id=u.id,
+                    display_name=u.display_name,
+                    profile_picture_key=u.profile_picture_key,
+                    public_key=u.public_key,
+                    role=role,
+                )
+                for role, u in members
+            ]
+            my_role = next((role for role, u in members if u.id == current_user_id), None)
+        else:
+            other = other_map.get(c.id)
+        out.append(ConversationResponse(
+            id=c.id,
+            is_group=c.is_group,
+            name=c.name,
+            created_at=c.created_at,
+            other_participant=UserPublic.model_validate(other) if other else None,
+            last_message=_preview(
+                last_msg, sender_map.get(last_msg.sender_id) if last_msg else None, c.is_group,
+            ),
+            unread_count=unread_map.get(c.id, 0),
+            participants=participants,
+            my_role=my_role,
+            is_pinned=bool(pref and pref.is_pinned),
+            mute_until=pref.mute_until if pref else None,
+            manual_unread=bool(pref and pref.manual_unread),
+        ))
+    return out
+
+
 async def _hydrate_conversation(
     db,
     conv: Conversation,
     current_user_id: UUID,
-    unread: Optional[int] = None,
 ) -> ConversationResponse:
-    """Fold a Conversation + last message + other participant + caller's prefs."""
-    last_msg = await _last_message(db, conv.id)
-    other = await _other_participant(db, conv.id, current_user_id)
-    pref = await _load_pref(db, conv.id, current_user_id)
-
-    # Unread count: messages from the other participant with no read_at,
-    # received by the current user. For 1:1, "from other" = sender_id != self.
-    # The list endpoint precomputes this in one batch query and passes it in.
-    if unread is None:
-        unread_q = await db.execute(
-            select(func.count(MessageMetadata.id)).where(
-                MessageMetadata.conversation_id == conv.id,
-                MessageMetadata.sender_id != current_user_id,
-                MessageMetadata.read_at.is_(None),
-            )
-        )
-        unread = int(unread_q.scalar() or 0)
-
-    return ConversationResponse(
-        id=conv.id,
-        is_group=conv.is_group,
-        name=conv.name,
-        created_at=conv.created_at,
-        other_participant=UserPublic.model_validate(other) if other else None,
-        last_message=LastMessagePreview.model_validate(last_msg) if last_msg else None,
-        unread_count=unread,
-        is_pinned=bool(pref and pref.is_pinned),
-        mute_until=pref.mute_until if pref else None,
-        manual_unread=bool(pref and pref.manual_unread),
-    )
+    """Single-conversation version of _build_responses."""
+    return (await _build_responses(db, [conv], current_user_id))[0]
 
 
 # ── Endpoints ─────────────────────────────────────────────────────────────────
@@ -361,9 +474,18 @@ async def list_conversations(
     request: Request,
     current_user: CurrentUser,
     db: DBSession,
+    include_groups: bool = Query(
+        False,
+        description="Include group chats. Sent by app builds that support "
+                    "groups; older builds never see them.",
+    ),
 ) -> list[ConversationResponse]:
-    # All conversations where the current user is a participant
-    rows = await db.execute(
+    if include_groups and not current_user.supports_groups:
+        # This user now runs a groups-capable build, so they may be added.
+        current_user.supports_groups = True
+        await db.flush()
+
+    q = (
         select(Conversation)
         .join(
             conversation_participants,
@@ -372,40 +494,11 @@ async def list_conversations(
         .where(conversation_participants.c.user_id == current_user.id)
         .order_by(desc(Conversation.created_at))
     )
-    convs = rows.scalars().all()
-    if not convs:
-        return []
-    conv_ids = [c.id for c in convs]
+    if not include_groups:
+        q = q.where(Conversation.is_group.is_(False))
+    convs = (await db.execute(q)).scalars().all()
 
-    # Everything is batched: 4 queries total for the whole list, regardless
-    # of how many conversations the user has. The previous per-conversation
-    # hydration paid 3 extra queries per row, which at WAN DB latency turned
-    # a 20-chat list into ~60 sequential round trips.
-    unread_map = await _unread_counts_for(db, conv_ids, current_user.id)
-    last_map = await _last_messages_for(db, conv_ids)
-    other_map = await _other_participants_for(db, conv_ids, current_user.id)
-    pref_map = await _prefs_for(db, conv_ids, current_user.id)
-
-    out: list[ConversationResponse] = []
-    for c in convs:
-        last_msg = last_map.get(c.id)
-        other = other_map.get(c.id)
-        pref = pref_map.get(c.id)
-        out.append(
-            ConversationResponse(
-                id=c.id,
-                is_group=c.is_group,
-                name=c.name,
-                created_at=c.created_at,
-                other_participant=UserPublic.model_validate(other) if other else None,
-                last_message=LastMessagePreview.model_validate(last_msg) if last_msg else None,
-                unread_count=unread_map.get(c.id, 0),
-                is_pinned=bool(pref and pref.is_pinned),
-                mute_until=pref.mute_until if pref else None,
-                manual_unread=bool(pref and pref.manual_unread),
-            )
-        )
-
+    out = await _build_responses(db, list(convs), current_user.id)
     # Sort by last-message recency (falls back to conv.created_at when empty)
     out.sort(
         key=lambda c: c.last_message.created_at if c.last_message else c.created_at,
@@ -500,11 +593,20 @@ async def list_messages(
     ),
     limit: int = Query(DEFAULT_MESSAGE_PAGE, ge=1, le=MAX_MESSAGE_PAGE),
 ) -> MessagePage:
-    await _ensure_participant(db, conversation_id, current_user.id)
+    me = await _ensure_participant(db, conversation_id, current_user.id)
+    conv = await db.get(Conversation, conversation_id)
+    is_group = bool(conv and conv.is_group)
 
     q = select(MessageMetadata).where(
         MessageMetadata.conversation_id == conversation_id,
     )
+    if is_group:
+        # Nothing from before this member joined (it was never encrypted for
+        # them) and nothing from people they've blocked.
+        q = q.where(
+            MessageMetadata.created_at >= me.joined_at,
+            MessageMetadata.sender_id.not_in(_blocked_by(current_user.id)),
+        )
     if before is not None:
         q = q.where(MessageMetadata.created_at < before)
     q = q.order_by(MessageMetadata.created_at.desc()).limit(limit)
@@ -530,6 +632,20 @@ async def list_messages(
     starred_set = await _load_starred_for(db, msg_ids, current_user.id)
     reply_previews = await _load_reply_previews(db, reply_ids)
 
+    # Groups: each message is decrypted with its SENDER's key (and labelled
+    # with their name) — senders may have left, so resolve them directly.
+    senders: dict[UUID, User] = {}
+    if is_group:
+        senders = await _users_by_id(
+            db,
+            [m.sender_id for m in rows] + [p.sender_id for p in reply_previews.values()],
+        )
+        for p in reply_previews.values():
+            u = senders.get(p.sender_id)
+            if u is not None:
+                p.sender_display_name = u.display_name
+                p.sender_public_key = u.public_key
+
     messages = [
         MessageResponse(
             id=m.id,
@@ -547,6 +663,8 @@ async def list_messages(
             reply_preview=reply_previews.get(m.reply_to_id) if m.reply_to_id else None,
             deleted_at=m.deleted_at,
             deleted_by=m.deleted_by,
+            sender_display_name=senders[m.sender_id].display_name if m.sender_id in senders else None,
+            sender_public_key=senders[m.sender_id].public_key if m.sender_id in senders else None,
         )
         for m in rows
     ]
@@ -663,6 +781,18 @@ async def leave_conversation(
     """
     await _ensure_participant(db, conversation_id, current_user.id)
 
+    conv = await db.get(Conversation, conversation_id)
+    if conv is not None and conv.is_group:
+        # Groups: admin hand-over, system line, empty-group cleanup, socket
+        # kick — all owned by the group service.
+        try:
+            change = await group_service.leave_group(db, current_user, conversation_id)
+        except GroupError as err:
+            raise _group_error(err)
+        await db.commit()
+        await group_service.publish_change(request.app.state.redis, change)
+        return None
+
     await db.execute(
         conversation_participants.delete().where(
             conversation_participants.c.conversation_id == conversation_id,
@@ -675,4 +805,118 @@ async def leave_conversation(
         await db.delete(pref)
 
     await db.flush()
+    return None
+
+
+# ── Group chat ────────────────────────────────────────────────────────────────
+
+@router.post(
+    "/groups",
+    response_model=ConversationResponse,
+    status_code=status.HTTP_201_CREATED,
+    summary="Create a group chat with some of your contacts",
+)
+@limiter.limit("10/minute")
+async def create_group(
+    request: Request,
+    body: GroupCreateRequest,
+    current_user: CurrentUser,
+    db: DBSession,
+) -> ConversationResponse:
+    caller_id = current_user.id
+    try:
+        conv, change = await group_service.create_group(db, current_user, body.name, body.member_ids)
+    except GroupError as err:
+        raise _group_error(err)
+    await db.commit()
+    await group_service.publish_change(request.app.state.redis, change)
+    return await _hydrate_conversation(db, conv, caller_id)
+
+
+@router.get(
+    "/{conversation_id}",
+    response_model=ConversationResponse,
+    summary="Fetch one conversation (e.g. after a group_update event)",
+)
+@limiter.limit("120/minute")
+async def get_conversation(
+    request: Request,
+    conversation_id: UUID,
+    current_user: CurrentUser,
+    db: DBSession,
+) -> ConversationResponse:
+    await _ensure_participant(db, conversation_id, current_user.id)
+    conv = await db.get(Conversation, conversation_id)
+    if conv is None:
+        raise HTTPException(status_code=404, detail="Conversation not found")
+    return await _hydrate_conversation(db, conv, current_user.id)
+
+
+@router.patch(
+    "/{conversation_id}",
+    response_model=ConversationResponse,
+    summary="Rename a group (admins only)",
+)
+@limiter.limit("30/minute")
+async def update_group(
+    request: Request,
+    conversation_id: UUID,
+    body: GroupUpdateRequest,
+    current_user: CurrentUser,
+    db: DBSession,
+) -> ConversationResponse:
+    caller_id = current_user.id
+    try:
+        change = await group_service.rename_group(db, current_user, conversation_id, body.name)
+    except GroupError as err:
+        raise _group_error(err)
+    await db.commit()
+    await group_service.publish_change(request.app.state.redis, change)
+    conv = await db.get(Conversation, conversation_id)
+    return await _hydrate_conversation(db, conv, caller_id)
+
+
+@router.post(
+    "/{conversation_id}/members",
+    response_model=ConversationResponse,
+    summary="Add contacts to a group (admins only)",
+)
+@limiter.limit("30/minute")
+async def add_group_members(
+    request: Request,
+    conversation_id: UUID,
+    body: GroupMembersAddRequest,
+    current_user: CurrentUser,
+    db: DBSession,
+) -> ConversationResponse:
+    caller_id = current_user.id
+    try:
+        change = await group_service.add_members(db, current_user, conversation_id, body.member_ids)
+    except GroupError as err:
+        raise _group_error(err)
+    await db.commit()
+    await group_service.publish_change(request.app.state.redis, change)
+    conv = await db.get(Conversation, conversation_id)
+    return await _hydrate_conversation(db, conv, caller_id)
+
+
+@router.delete(
+    "/{conversation_id}/members/{user_id}",
+    status_code=status.HTTP_204_NO_CONTENT,
+    summary="Remove a member (admins), or yourself (= leave the group)",
+)
+@limiter.limit("30/minute")
+async def remove_group_member(
+    request: Request,
+    conversation_id: UUID,
+    user_id: UUID,
+    current_user: CurrentUser,
+    db: DBSession,
+) -> None:
+    try:
+        change = await group_service.remove_member(db, current_user, conversation_id, user_id)
+    except GroupError as err:
+        raise _group_error(err)
+    await db.commit()
+    await group_service.publish_change(request.app.state.redis, change)
     return None

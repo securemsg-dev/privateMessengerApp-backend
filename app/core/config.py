@@ -125,6 +125,11 @@ class Settings(BaseSettings):
     # How long a freshly-issued upload URL stays valid (server clock).
     MEDIA_UPLOAD_URL_TTL_SECONDS: int = 600
 
+    # ── Group chat ───────────────────────────────────────────────────────
+    # Including the creator. Each group message carries one wrapped key per
+    # member (~140 B), so 50 members ≈ 7 KB — well inside WS_MAX_FRAME_BYTES.
+    GROUP_MAX_MEMBERS: int = 50
+
     # ── WebSocket protection ─────────────────────────────────────────────
     # Largest inbound WS frame we accept. Text messages are small; media
     # travels through the blob endpoints, so 64 KB is generous. Without a

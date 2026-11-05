@@ -23,7 +23,7 @@ from app.core.limiter import limiter
 from app.db.models.conversation import conversation_participants
 from app.db.models.deleted_message import DeletedMessage
 from app.db.models.media_blob import MediaBlob
-from app.db.models.message import MessageMetadata
+from app.db.models.message import MessageMetadata, MessageType
 from app.db.models.starred_message import StarredMessage
 from app.schemas.messaging import DeleteMessageRequest, StarMessageRequest
 from app.services.media_storage import storage_for
@@ -137,6 +137,12 @@ async def delete_message(
         return None
 
     # scope == "everyone"
+    if msg.message_type == MessageType.system:
+        # Group events ("Alice added Bob") belong to the group, not the actor.
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="This message can't be deleted for everyone",
+        )
     if msg.sender_id != current_user.id:
         raise HTTPException(
             status_code=status.HTTP_403_FORBIDDEN,

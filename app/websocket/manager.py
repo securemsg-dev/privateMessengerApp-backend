@@ -39,6 +39,8 @@ from fastapi import WebSocket
 logger = logging.getLogger(__name__)
 
 CONV_CHANNEL_PREFIX = "conversation"
+# Close code for "not (or no longer) a member of this conversation".
+REMOVED_CLOSE_CODE = 4403
 USER_CHANNEL_PREFIX = "user"
 
 
@@ -251,14 +253,16 @@ class ConnectionManager:
         never published at all (see websocket/router.py::_handle_message).
         """
         skip: set[str] = set()
-        if "_skip_user_ids" in data:
+        close_after: set[str] = set()
+        if "_skip_user_ids" in data or "_close_user_ids" in data:
             try:
                 payload = json.loads(data)
                 skip = {str(u) for u in payload.pop("_skip_user_ids", [])}
+                close_after = {str(u) for u in payload.pop("_close_user_ids", [])}
                 data = json.dumps(payload)
             except (ValueError, TypeError, AttributeError):
-                logger.warning("Could not parse _skip_user_ids; delivering to all")
-                skip = set()
+                logger.warning("Could not parse routing hints; delivering to all")
+                skip, close_after = set(), set()
 
         # Presence frames only go to sockets that opted in (?presence=1).
         presence_only = '"presence"' in data and _is_presence_event(data)
@@ -279,6 +283,17 @@ class ConnectionManager:
 
         for user_id, ws in disconnected:
             await self.disconnect(ws, conversation_id, user_id)
+
+        # Removed group members: close their sockets on this conversation
+        # (after they received the frame above). 4403 = "you no longer have
+        # access" — clients treat it as final instead of reconnecting.
+        for user_id in close_after:
+            for ws in list(user_sockets.get(user_id, [])):
+                try:
+                    await ws.close(code=REMOVED_CLOSE_CODE)
+                except Exception:
+                    pass
+                await self.disconnect(ws, conversation_id, user_id)
 
     async def broadcast_to_user(self, user_id: str, data: str) -> None:
         """Send `data` to every WebSocket the target user has open on THIS instance."""

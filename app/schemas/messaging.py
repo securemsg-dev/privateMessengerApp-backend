@@ -120,8 +120,51 @@ class LastMessagePreview(BaseModel):
     encrypted_payload: str
     created_at: datetime
     self_destruct: bool
+    # Groups only: who sent it (for "Alice: …" previews) and the key that
+    # decrypts it — the sender may have left, so they can't come from the
+    # member list.
+    sender_display_name: Optional[str] = None
+    sender_public_key: Optional[str] = None
 
     model_config = {"from_attributes": True}
+
+
+ParticipantRole = Literal["admin", "member"]
+
+
+class GroupMember(BaseModel):
+    """A group member as other members see them. Deliberately has NO
+    private_number: being in a group with someone must not reveal their
+    number to strangers."""
+    id: UUID
+    display_name: Optional[str] = None
+    profile_picture_key: Optional[str] = None
+    public_key: Optional[str] = None
+    role: ParticipantRole = "member"
+
+
+def _clean_group_name(v: str) -> str:
+    v = " ".join(v.split())
+    if not v:
+        raise ValueError("Group name cannot be empty")
+    return v
+
+
+class GroupCreateRequest(BaseModel):
+    name: str = Field(min_length=1, max_length=100)
+    member_ids: list[UUID] = Field(min_length=1, max_length=99)
+
+    _name = field_validator("name")(classmethod(lambda cls, v: _clean_group_name(v)))
+
+
+class GroupMembersAddRequest(BaseModel):
+    member_ids: list[UUID] = Field(min_length=1, max_length=99)
+
+
+class GroupUpdateRequest(BaseModel):
+    name: str = Field(min_length=1, max_length=100)
+
+    _name = field_validator("name")(classmethod(lambda cls, v: _clean_group_name(v)))
 
 
 class ConversationResponse(BaseModel):
@@ -141,6 +184,9 @@ class ConversationResponse(BaseModel):
     other_participant: Optional[UserPublic]
     last_message: Optional[LastMessagePreview]
     unread_count: int = 0
+    # Groups only: every current member (incl. the caller) and the caller's role.
+    participants: Optional[list[GroupMember]] = None
+    my_role: Optional[ParticipantRole] = None
 
     # ── Per-user prefs (Phase C.1) ────────────────────────────────────
     is_pinned: bool = False
@@ -189,6 +235,8 @@ class MessageReplyPreview(BaseModel):
     sender_id: UUID
     message_type: MessageTypeLiteral
     encrypted_payload: str
+    sender_display_name: Optional[str] = None
+    sender_public_key: Optional[str] = None
 
     model_config = {"from_attributes": True}
 
@@ -222,6 +270,9 @@ class MessageResponse(BaseModel):
     reply_preview: Optional[MessageReplyPreview] = None
     deleted_at: Optional[datetime] = None
     deleted_by: Optional[UUID] = None
+    # Groups only (see LastMessagePreview).
+    sender_display_name: Optional[str] = None
+    sender_public_key: Optional[str] = None
 
     model_config = {"from_attributes": True}
 
