@@ -229,3 +229,14 @@ async def test_s3_delete_is_idempotent(storages):
     await s3.delete_bytes(blob_id)  # second delete: no error
     assert await s3.object_size(blob_id) is None
     assert await s3.read_bytes(blob_id) is None
+
+
+@pytest.mark.parametrize(
+    "raw, expected",
+    [("virtual-host", "virtual"), ("Virtual-Host", "virtual"), ("virtual", "virtual"), ("path", "path"), ("", "virtual")],
+)
+def test_url_style_accepts_railway_spelling(raw, expected):
+    # Railway's bucket credentials export AWS_S3_URL_STYLE=virtual-host.
+    from app.core.config import Settings
+
+    assert Settings(AWS_S3_URL_STYLE=raw).AWS_S3_URL_STYLE == expected

@@ -97,6 +97,15 @@ class Settings(BaseSettings):
     # "path" (https://host/bucket/key) or "virtual" (https://bucket.host/key).
     # Must match the bucket's urlStyle or signatures won't verify.
     AWS_S3_URL_STYLE: Literal["path", "virtual"] = "virtual"
+
+    @field_validator("AWS_S3_URL_STYLE", mode="before")
+    @classmethod
+    def _normalize_url_style(cls, v: str) -> str:
+        # Railway's bucket credentials say "virtual-host"; boto3 calls it
+        # "virtual". Accept either so the copied variables boot as-is.
+        v = (v or "").strip().lower()
+        return "virtual" if v in ("", "virtual-host", "virtual-hosted") else v
+
     # Lifetime of presigned download URLs handed to clients.
     AWS_S3_PRESIGN_EXPIRY_SECONDS: int = 3600
 
