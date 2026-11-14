@@ -35,6 +35,7 @@ from app.api.v1.endpoints import health, legal
 from app.api.v1.router import api_router
 from app.core.config import settings
 from app.core.limiter import limiter
+from app.core.perf import PerfLogMiddleware
 from app.db.session import engine
 from app.services.maintenance import run_maintenance_loop
 from app.services.media_storage import default_storage, get_backend
@@ -190,6 +191,9 @@ def create_app() -> FastAPI:
 
     # ── Request-validation (422) logging ──────────────────────────────────
     app.add_exception_handler(RequestValidationError, _validation_error_handler)
+
+    # ── Per-request timing (no-op unless PERF_LOGGING_ENABLED) ────────────
+    app.add_middleware(PerfLogMiddleware)
 
     # ── CORS ──────────────────────────────────────────────────────────────
     app.add_middleware(

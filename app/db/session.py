@@ -14,11 +14,13 @@ from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_asyn
 from app.core.config import settings
 
 # Create the async engine.
-# pool_pre_ping=True avoids "connection lost" errors on long-idle connections.
+# Stale connections are handled by pool_recycle rather than pool_pre_ping:
+# the ping is three network round trips per request (see config.py).
 engine = create_async_engine(
     settings.DATABASE_URL,
     echo=settings.DEBUG,  # Log SQL in development; disable in production
-    pool_pre_ping=True,
+    pool_pre_ping=settings.DB_POOL_PRE_PING,
+    pool_recycle=settings.DB_POOL_RECYCLE_SECONDS,
     pool_size=10,
     max_overflow=20,
 )

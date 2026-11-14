@@ -73,8 +73,28 @@ class Settings(BaseSettings):
                 return "postgresql+asyncpg://" + v[len(prefix):]
         return v
 
+    # Connection pool health. Pre-ping costs THREE extra round trips on every
+    # checkout with asyncpg (BEGIN, empty query, ROLLBACK), i.e. on every
+    # request. Off by default: connections are instead retired after
+    # DB_POOL_RECYCLE_SECONDS (free — checked locally), and SQLAlchemy drops
+    # the whole pool on the first disconnect error, so a Postgres restart
+    # costs at most one failed request. Set true to restore the old behaviour.
+    DB_POOL_PRE_PING: bool = False
+    DB_POOL_RECYCLE_SECONDS: int = 300
+
     # ── Redis ────────────────────────────────────────────────────────────
     REDIS_URL: str = "redis://localhost:6379/0"
+
+    # ── Caching / performance ────────────────────────────────────────────
+    # Master switch for the Redis read cache (app/core/cache.py). False turns
+    # every cache read into a miss — an instant, deploy-free rollback.
+    CACHE_ENABLED: bool = True
+    # Longest a single cache call may wait on Redis before falling back to
+    # Postgres.
+    CACHE_OP_TIMEOUT_SECONDS: float = 0.2
+    # One "[perf]" log line per HTTP request (duration + DB round trips +
+    # cache hits). Meant for staging / short measurement windows.
+    PERF_LOGGING_ENABLED: bool = False
 
     # ── JWT ──────────────────────────────────────────────────────────────
     JWT_SECRET_KEY: str = "changeme"
