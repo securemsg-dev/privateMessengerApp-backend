@@ -25,6 +25,7 @@ from app.core.security import (
     hash_password_async,
     verify_password_async,
 )
+from app.db.models.conversation import conversation_participants
 from app.db.models.media_blob import MediaBlob
 from app.db.models.session import Session as UserSession
 from app.db.models.user import User
@@ -196,7 +197,7 @@ async def change_login_password(
     )
 
 
-async def delete_user_by_id(user_id: UUID, db: AsyncSession) -> None:
+async def delete_user_by_id(user_id: UUID, db: AsyncSession) -> list[UUID]:
     """
     Hard-delete a user row by id. Trust is established by the caller having
     already presented a valid delete-intent token; this function does not
@@ -205,12 +206,21 @@ async def delete_user_by_id(user_id: UUID, db: AsyncSession) -> None:
     FK cascades wipe devices, sessions, contacts, messages, and conversation
     participations. Idempotent: if the user is already gone (e.g. concurrent
     delete from another device), logs and returns normally.
+
+    Returns the ids of every conversation the user was in. The caller must
+    commit and then pass them to forget_participants() — the cascade changes
+    those member lists without going through any code that invalidates them.
     """
     result = await db.execute(select(User).where(User.id == user_id))
     user = result.scalar_one_or_none()
     if user is None:
         logger.info("delete_user_by_id: user already gone | user_id=%s", user_id)
-        return
+        return []
+
+    conversation_ids = list((await db.execute(
+        select(conversation_participants.c.conversation_id)
+        .where(conversation_participants.c.user_id == user_id)
+    )).scalars().all())
 
     # Leave groups through the group service first: a bare FK cascade would
     # skip admin hand-over and leave empty groups behind.
@@ -238,6 +248,7 @@ async def delete_user_by_id(user_id: UUID, db: AsyncSession) -> None:
 
     await db.delete(user)
     await db.flush()
+    return conversation_ids
 
 
 async def create_session(

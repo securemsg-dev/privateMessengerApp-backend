@@ -55,6 +55,7 @@ from app.schemas.auth import (
 )
 from app.services import auth_service
 from app.services.auth_service import AuthOutcome
+from app.services.moderation_service import forget_participants
 
 logger = logging.getLogger(__name__)
 
@@ -309,7 +310,9 @@ async def confirm_delete(
             detail="Invalid or expired delete token",
         ) from exc
 
-    await auth_service.delete_user_by_id(user_id, db)
+    conversation_ids = await auth_service.delete_user_by_id(user_id, db)
+    await db.commit()
+    await forget_participants(request.app.state.redis, *conversation_ids)
     logger.info("[CONFIRM_DELETE] user_id=%s", user_id)
     return MessageResponse(message="Account deleted.")
 

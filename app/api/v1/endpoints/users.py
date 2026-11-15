@@ -23,6 +23,7 @@ from app.schemas.messaging import (
     UserPublic,
 )
 from app.services import auth_service
+from app.services.moderation_service import forget_participants
 from app.services.presence import publish_presence
 
 logger = logging.getLogger(__name__)
@@ -149,8 +150,11 @@ async def delete_me(
     Distinct from POST /auth/confirm-delete, which deletes via a delete-intent
     token issued by the delete-password login flow (no authenticated session).
     """
-    await auth_service.delete_user_by_id(current_user.id, db)
-    logger.info("[DELETE_ME] user_id=%s", current_user.id)
+    user_id = current_user.id  # captured: the row is gone after the commit
+    conversation_ids = await auth_service.delete_user_by_id(user_id, db)
+    await db.commit()
+    await forget_participants(request.app.state.redis, *conversation_ids)
+    logger.info("[DELETE_ME] user_id=%s", user_id)
     return MessageResponse(message="Account deleted.")
 
 

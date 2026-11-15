@@ -55,6 +55,7 @@ from app.schemas.messaging import (
 )
 from app.services import group_service
 from app.services.group_service import GroupError
+from app.services.moderation_service import forget_participants
 
 # Per-user pin limit for the chat list. Mirrors the frontend's PIN_LIMIT.
 PIN_LIMIT = 5
@@ -809,7 +810,10 @@ async def leave_conversation(
     if pref:
         await db.delete(pref)
 
-    await db.flush()
+    # Commit before invalidating, or a concurrent send could re-cache the
+    # pre-leave member list in between.
+    await db.commit()
+    await forget_participants(request.app.state.redis, conversation_id)
     return None
 
 

@@ -17,8 +17,14 @@ import uuid
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.core.cache import cache_delete, cache_get, cache_set
 from app.db.models.blocked_user import BlockedUser
 from app.db.models.conversation import conversation_participants
+
+# Member lists change rarely (group add/remove/leave, 1:1 leave, account
+# delete) and every one of those writes calls forget_participants() after its
+# commit, so the TTL is only the safety net for a missed invalidation.
+MEMBERS_CACHE_TTL_SECONDS = 300
 
 
 async def is_blocked(
@@ -88,10 +94,50 @@ async def participant_ids(
     db: AsyncSession,
     conversation_id: uuid.UUID,
 ) -> set[uuid.UUID]:
-    """All user ids participating in a conversation."""
+    """All user ids participating in a conversation (always from Postgres)."""
     rows = (await db.execute(
         select(conversation_participants.c.user_id).where(
             conversation_participants.c.conversation_id == conversation_id,
         )
     )).scalars().all()
     return set(rows)
+
+
+def _members_key(conversation_id) -> str:
+    return f"conv:{conversation_id}:members"
+
+
+async def cached_participant_ids(
+    db: AsyncSession,
+    redis,
+    conversation_id: uuid.UUID,
+    *,
+    fresh: bool = False,
+) -> set[uuid.UUID]:
+    """
+    participant_ids() through the Redis cache — saves a Postgres round trip on
+    every message send, reaction and new-message fan-out.
+
+    The cache can trail a membership change by a moment (a reader racing the
+    write's invalidation). Callers that REJECT something because of
+    membership must confirm with `fresh=True` first; that re-reads Postgres
+    and overwrites the cache, so a stale entry heals on first contradiction.
+    """
+    key = _members_key(conversation_id)
+    if not fresh:
+        hit = await cache_get(redis, key)
+        if isinstance(hit, list):
+            try:
+                return {uuid.UUID(x) for x in hit}
+            except (TypeError, ValueError):
+                pass  # malformed entry → reload
+    members = await participant_ids(db, conversation_id)
+    await cache_set(
+        redis, key, sorted(str(m) for m in members), ttl=MEMBERS_CACHE_TTL_SECONDS,
+    )
+    return members
+
+
+async def forget_participants(redis, *conversation_ids) -> None:
+    """Invalidate cached member lists. Call AFTER the membership write commits."""
+    await cache_delete(redis, *[_members_key(c) for c in conversation_ids])

@@ -38,6 +38,7 @@ from app.db.models.conversation import Conversation, conversation_participants
 from app.db.models.conversation_pref import ConversationPref
 from app.db.models.message import MessageMetadata, MessageType
 from app.db.models.user import User
+from app.services.moderation_service import forget_participants
 from app.websocket.manager import manager
 
 logger = logging.getLogger(__name__)
@@ -392,6 +393,10 @@ def system_message_event(msg: MessageMetadata) -> dict:
 async def publish_change(redis: aioredis.Redis, change: GroupChange) -> None:
     """Fan the change out. Best-effort: the DB is already committed."""
     conv_id = str(change.conversation_id)
+    # First, so no send after the kick below can be checked against the old
+    # member list. Runs after the commit (callers' contract), so a reader
+    # can't re-cache the pre-change list. Fail-open: never raises.
+    await forget_participants(redis, change.conversation_id)
     try:
         if change.system_message is not None:
             await manager.publish(redis, conv_id, system_message_event(change.system_message))

@@ -57,7 +57,11 @@ from app.db.models.message import MessageMetadata, MessageType
 from app.db.models.message_reaction import MessageReaction
 from app.db.models.user import User
 from app.db.session import AsyncSessionLocal
-from app.services.moderation_service import participant_ids, recipients_blocking
+from app.services.moderation_service import (
+    cached_participant_ids,
+    participant_ids,
+    recipients_blocking,
+)
 from app.services.presence import snapshot_for as presence_snapshot_for
 from app.services.push_service import send_push_to_users
 from app.websocket.manager import REMOVED_CLOSE_CODE, manager
@@ -316,18 +320,31 @@ async def _persist_and_publish_message(
     async with AsyncSessionLocal() as db:
         # Membership is re-checked on every send: a member removed from a
         # group may still hold an open socket for a moment.
-        members = await participant_ids(db, conversation_id)
-        if user_id not in members:
-            await fail("You are no longer a member of this conversation", code="not_a_member")
+        #
+        # E2EE groups: the message key must be wrapped for EXACTLY the
+        # current members — no one missing (they couldn't read it), no one
+        # extra (removed members). A stale member list on the client gets
+        # group_members_changed and re-encrypts.
+        envelope_ids = _group_envelope_recipients(encrypted_payload) if ctx.is_group else None
+
+        def member_check(members: set[UUID]) -> Optional[tuple[str, str]]:
+            if user_id not in members:
+                return "You are no longer a member of this conversation", "not_a_member"
+            if ctx.is_group and envelope_ids != {str(m) for m in members}:
+                return "Group members changed — re-encrypt and resend", "group_members_changed"
+            return None
+
+        # Cached member list first; a rejection is confirmed against Postgres
+        # so a cache entry trailing a membership change can never wrongly
+        # bounce a send (and the re-read repairs the entry).
+        members = await cached_participant_ids(db, redis, conversation_id)
+        problem = member_check(members)
+        if problem is not None:
+            members = await cached_participant_ids(db, redis, conversation_id, fresh=True)
+            problem = member_check(members)
+        if problem is not None:
+            await fail(problem[0], code=problem[1])
             return
-        if ctx.is_group:
-            # E2EE groups: the message key must be wrapped for EXACTLY the
-            # current members — no one missing (they couldn't read it), no
-            # one extra (removed members). A stale member list on the client
-            # gets this error and re-encrypts.
-            if _group_envelope_recipients(encrypted_payload) != {str(m) for m in members}:
-                await fail("Group members changed — re-encrypt and resend", code="group_members_changed")
-                return
 
         # If replying, verify the target lives in THIS conversation — stops
         # clients from cross-stitching threads they shouldn't have access to.
@@ -470,13 +487,10 @@ async def _notify_new_message(
     """
     try:
         async with AsyncSessionLocal() as db:
-            rows = await db.execute(
-                select(conversation_participants.c.user_id).where(
-                    conversation_participants.c.conversation_id == conversation_id,
-                    conversation_participants.c.user_id != sender_id,
-                )
+            # Usually a cache hit: the send path just loaded this list.
+            other_ids: list[UUID] = list(
+                await cached_participant_ids(db, redis, conversation_id) - {sender_id}
             )
-            other_ids: list[UUID] = [r.user_id for r in rows]
             # Participants who blocked the sender get no live update and no
             # push either — otherwise a block would still leak a banner.
             skip = {str(u) for u in event.get("_skip_user_ids", [])}
@@ -598,7 +612,11 @@ async def _handle_reaction(
         if target.message_type == MessageType.system:
             await _send_error(websocket, "Can't react to this message")
             return
-        if ctx.is_group and user_id not in await participant_ids(db, conversation_id):
+        if ctx.is_group and (
+            user_id not in await cached_participant_ids(db, redis, conversation_id)
+            # Confirm a rejection against Postgres (the cache may trail a join).
+            and user_id not in await cached_participant_ids(db, redis, conversation_id, fresh=True)
+        ):
             await _send_error(websocket, "You are no longer a member", code="not_a_member")
             return
 
