@@ -14,11 +14,12 @@ Reactions are intentionally NOT here — they fan out via WebSocket so peers
 see them in real time (see app/websocket/router.py).
 """
 
+import logging
 from datetime import datetime, timedelta, timezone
 from uuid import UUID
 
 from fastapi import APIRouter, HTTPException, Request, status
-from sqlalchemy import select
+from sqlalchemy import select, update
 
 from app.core.dependencies import CurrentUser, DBSession
 from app.core.limiter import limiter
@@ -33,6 +34,8 @@ from app.websocket.manager import manager
 
 # How long after sending a message you can still wipe it for everyone.
 DELETE_FOR_EVERYONE_WINDOW = timedelta(hours=24)
+
+logger = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/messages", tags=["Messages"])
 
@@ -230,26 +233,52 @@ async def mark_view_once_opened(
     if msg.opened_at is not None or msg.deleted_at is not None:
         return None
 
+    conversation_id, blob_id = msg.conversation_id, msg.media_blob_id
+    redis = request.app.state.redis
     now = datetime.now(timezone.utc)
-    msg.opened_at = now
-    msg.encrypted_payload = ""  # the media key lived in here
-    if msg.media_blob_id is not None:
-        blob = (await db.execute(
-            select(MediaBlob).where(MediaBlob.id == msg.media_blob_id)
-        )).scalar_one_or_none()
-        msg.media_blob_id = None
-        if blob is not None:
-            await storage_for(blob).delete_bytes(blob.id)
-            await db.delete(blob)
-            # The bytes are gone — stop handing out the cached download URL.
-            await forget_download_url(request.app.state.redis, blob.id)
-    await db.flush()
 
-    await manager.publish(request.app.state.redis, str(msg.conversation_id), {
-        "type": "view_once_opened",
-        "conversation_id": str(msg.conversation_id),
-        "message_id": str(msg.id),
-        "by_user_id": str(current_user.id),
-        "timestamp": now.isoformat(),
-    })
+    # One conditional UPDATE decides who opens it. Concurrent opens (two
+    # devices, or a retry after a timeout) race here: Postgres re-checks the
+    # WHERE after the winner commits, so the loser matches 0 rows and is a
+    # no-op instead of a 500.
+    claimed = await db.execute(
+        update(MessageMetadata)
+        .where(
+            MessageMetadata.id == message_id,
+            MessageMetadata.opened_at.is_(None),
+            MessageMetadata.deleted_at.is_(None),
+        )
+        .values(opened_at=now, encrypted_payload="", media_blob_id=None)  # payload held the media key
+        .execution_options(synchronize_session=False)
+    )
+    if claimed.rowcount == 0:
+        return None
+    # Commit BEFORE touching storage: if deleting the bytes then fails, the
+    # message is still correctly "Opened" and the unreferenced blob is
+    # removed later by the maintenance orphan sweep.
+    await db.commit()
+
+    if blob_id is not None:
+        # The bytes are going — stop handing out the cached download URL.
+        await forget_download_url(redis, blob_id)
+        blob = await db.get(MediaBlob, blob_id)
+        if blob is not None:
+            try:
+                await storage_for(blob).delete_bytes(blob.id)
+                await db.delete(blob)
+                await db.commit()
+            except Exception:  # noqa: BLE001
+                await db.rollback()
+                logger.warning("view-once blob cleanup deferred to sweep blob=%s", blob_id, exc_info=True)
+
+    try:
+        await manager.publish(redis, str(conversation_id), {
+            "type": "view_once_opened",
+            "conversation_id": str(conversation_id),
+            "message_id": str(message_id),
+            "by_user_id": str(current_user.id),
+            "timestamp": now.isoformat(),
+        })
+    except Exception:  # noqa: BLE001 — opening already succeeded; peers see it on next history load
+        logger.warning("view_once_opened publish failed msg=%s", message_id, exc_info=True)
     return None

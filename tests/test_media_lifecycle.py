@@ -195,6 +195,67 @@ async def test_view_once_opened_wipes_payload_and_blob(client, db_session, tmp_p
     assert row["encrypted_payload"] == ""
 
 
+async def test_view_once_open_survives_storage_failure(client, db_session, tmp_path):
+    """The open is committed before the bytes are deleted: a storage error
+    must not fail the request or leave the message un-opened. The blob row
+    stays behind unreferenced for the maintenance orphan sweep."""
+    storage = LocalFileStorage(base_path=str(tmp_path))
+    _, bob, _, blob, msg = await _view_once_message(client, db_session, storage)
+    blob_id = blob.id
+
+    async def broken_delete(_blob_id):
+        raise OSError("bucket unavailable")
+
+    with patch("app.api.v1.endpoints.messages.storage_for", return_value=storage), \
+         patch.object(storage, "delete_bytes", side_effect=broken_delete):
+        resp = await client.post(
+            f"/api/v1/messages/{msg.id}/opened",
+            headers=auth_header(bob["tokens"]["access_token"]),
+        )
+    assert resp.status_code == 204
+
+    await db_session.refresh(msg)
+    assert msg.opened_at is not None
+    assert msg.encrypted_payload == ""
+    assert msg.media_blob_id is None
+    # Not referenced by any message any more → the orphan sweep's job.
+    assert await db_session.get(MediaBlob, blob_id) is not None
+
+
+async def test_view_once_second_open_after_race_is_noop(client, db_session, tmp_path):
+    """Simulates losing the race: the row was opened by another request
+    between our read and our UPDATE. The conditional UPDATE matches nothing
+    and the call is a quiet no-op, not a 500."""
+    storage = LocalFileStorage(base_path=str(tmp_path))
+    _, bob, _, blob, msg = await _view_once_message(client, db_session, storage)
+
+    from app.api.v1.endpoints import messages as messages_ep
+    real_resolve = messages_ep._resolve_message_for_user
+
+    async def resolve_then_lose_race(db, message_id, user_id):
+        found = await real_resolve(db, message_id, user_id)
+        # Another request opens it first. synchronize_session=False leaves
+        # our in-memory copy stale (opened_at still None), like a real race.
+        await db.execute(
+            messages_ep.update(MessageMetadata)
+            .where(MessageMetadata.id == message_id)
+            .values(opened_at=datetime.now(timezone.utc))
+            .execution_options(synchronize_session=False)
+        )
+        assert found.opened_at is None
+        return found
+
+    with patch("app.api.v1.endpoints.messages.storage_for", return_value=storage), \
+         patch.object(messages_ep, "_resolve_message_for_user", side_effect=resolve_then_lose_race):
+        resp = await client.post(
+            f"/api/v1/messages/{msg.id}/opened",
+            headers=auth_header(bob["tokens"]["access_token"]),
+        )
+    assert resp.status_code == 204
+    # The loser touched nothing: the blob is still there for the winner's flow.
+    assert await db_session.get(MediaBlob, blob.id) is not None
+
+
 async def test_opened_rejects_normal_messages(client, db_session, tmp_path):
     alice = await register_and_login(client)
     bob = await register_and_login(client)
