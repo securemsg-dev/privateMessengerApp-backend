@@ -36,6 +36,33 @@ OCTET_STREAM = "application/octet-stream"
 STREAM_CHUNK_BYTES = 256 * 1024
 
 
+# ── Presigned download-URL cache ──────────────────────────────────────────────
+# A presigned bucket URL stays valid for an hour, so the same URL can be handed
+# to every client that asks for the blob in that window instead of looking the
+# blob up in Postgres and signing again each time. Entries are dropped as soon
+# as the blob is deleted (delete-for-everyone, view-once opened) and expire on
+# their own before the URL does. Only the URL to CIPHERTEXT is cached — never
+# keys or content. A stale entry is harmless: the bytes are gone, so the URL
+# just returns 404.
+
+# Stop serving a cached URL this long before it expires, so a client always
+# has time to finish the download it starts.
+DOWNLOAD_URL_CACHE_MARGIN_SECONDS = 300
+
+
+def download_url_cache_key(blob_id) -> str:
+    return f"media:url:{blob_id}"
+
+
+async def forget_download_url(redis, *blob_ids) -> None:
+    """Invalidate cached download URLs (call whenever a blob is deleted)."""
+    from app.core.cache import cache_delete
+
+    keys = [download_url_cache_key(b) for b in blob_ids if b is not None]
+    if keys:
+        await cache_delete(redis, *keys)
+
+
 def api_media_path(blob_id: UUID) -> str:
     """App-relative URL of a blob's PUT/GET endpoint (stable forever: it is
     embedded inside E2EE envelopes that old app builds fetch)."""

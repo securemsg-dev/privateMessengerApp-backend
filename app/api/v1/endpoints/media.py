@@ -36,10 +36,14 @@ from app.schemas.messaging import (
     MediaUploadRequest,
     MediaUploadResponse,
 )
+from app.core.cache import cache_get, cache_set
 from app.services.media_storage import (
+    DOWNLOAD_URL_CACHE_MARGIN_SECONDS,
     OCTET_STREAM,
     api_media_path,
     default_storage,
+    download_url_cache_key,
+    forget_download_url,
     storage_for,
 )
 
@@ -155,6 +159,7 @@ async def complete_direct_upload(
     if size != blob.size_bytes:
         # Don't keep (or let anyone reference) a mismatched object.
         await storage.delete_bytes(blob.id)
+        await forget_download_url(getattr(request.app.state, "redis", None), blob.id)
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
             detail=f"Uploaded {size} bytes, but reservation declared {blob.size_bytes}",
@@ -184,17 +189,42 @@ async def download_urls(
     authenticated user — the bytes are ciphertext.
     """
     _ = current_user
+    redis = getattr(request.app.state, "redis", None)
     ids = list(dict.fromkeys(body.blob_ids))  # dedupe, keep order
+
+    # Presigned bucket URLs are reused from Redis while they are still fresh
+    # (see media_storage: download-URL cache); only the rest touch Postgres.
+    urls: dict[str, MediaDownloadUrl] = {}
+    now = datetime.now(timezone.utc)
+    missing: list[UUID] = []
+    for blob_id in ids:
+        hit = await cache_get(redis, download_url_cache_key(blob_id))
+        try:
+            expires_at = datetime.fromisoformat(hit["expires_at"]) if hit else None
+            if expires_at and expires_at - now > timedelta(seconds=DOWNLOAD_URL_CACHE_MARGIN_SECONDS):
+                urls[str(blob_id)] = MediaDownloadUrl(url=hit["url"], auth=False, expires_at=expires_at)
+                continue
+        except (KeyError, TypeError, ValueError):
+            pass  # malformed entry → treat as a miss
+        missing.append(blob_id)
+    if not missing:
+        return MediaDownloadUrlsResponse(urls=urls)
+
     blobs = (await db.execute(
-        select(MediaBlob).where(MediaBlob.id.in_(ids), MediaBlob.uploaded_at.is_not(None))
+        select(MediaBlob).where(MediaBlob.id.in_(missing), MediaBlob.uploaded_at.is_not(None))
     )).scalars().all()
 
-    urls: dict[str, MediaDownloadUrl] = {}
     for blob in blobs:
         storage = storage_for(blob)
         if storage.supports_direct:
             url, expires_at = await storage.presign_download(blob.id)
             urls[str(blob.id)] = MediaDownloadUrl(url=url, auth=False, expires_at=expires_at)
+            ttl = int((expires_at - now).total_seconds()) - DOWNLOAD_URL_CACHE_MARGIN_SECONDS
+            if ttl > 0:
+                await cache_set(
+                    redis, download_url_cache_key(blob.id),
+                    {"url": url, "expires_at": expires_at.isoformat()}, ttl=ttl,
+                )
         else:
             urls[str(blob.id)] = MediaDownloadUrl(
                 url=_absolute_url(request, api_media_path(blob.id)), auth=True,

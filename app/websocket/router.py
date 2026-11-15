@@ -154,6 +154,23 @@ def _group_envelope_recipients(payload: str) -> Optional[set[str]]:
 
 # ── Event handlers ────────────────────────────────────────────────────────────
 
+# ── Send idempotency ─────────────────────────────────────────────────────────
+# A client that never saw the echo of its message (socket dropped between the
+# INSERT and the publish) retries the SAME frame under the same
+# client_temp_id. Without this the retry would be stored a second time and
+# every recipient would see the message twice.
+#
+# Redis key per (conversation, sender, client_temp_id):
+#   ""            → a send with this id is in flight right now
+#   "<event json>" → it was stored; re-echo this to the sender instead
+# Fail open: if Redis is unavailable the message is simply sent as before.
+SEND_DEDUPE_TTL_SECONDS = 600
+
+
+def _dedupe_key(conv_id_str: str, user_id_str: str, client_temp_id: str) -> str:
+    return f"ws:sent:{conv_id_str}:{user_id_str}:{client_temp_id}"
+
+
 async def _handle_message(
     websocket: WebSocket,
     redis: aioredis.Redis,
@@ -164,7 +181,64 @@ async def _handle_message(
     data: dict,
     ctx: ConnContext = ConnContext(),
 ) -> None:
-    """Persist + publish a new chat message."""
+    """Persist + publish a new chat message, at most once per client_temp_id."""
+    raw_temp = data.get("client_temp_id")
+    key: Optional[str] = (
+        _dedupe_key(conv_id_str, user_id_str, raw_temp)
+        if isinstance(raw_temp, str) and 0 < len(raw_temp) <= 64
+        else None
+    )
+    claimed = False
+    if key is not None:
+        try:
+            claimed = bool(await redis.set(key, "", nx=True, ex=SEND_DEDUPE_TTL_SECONDS))
+            if not claimed:
+                previous = await redis.get(key)
+                if isinstance(previous, bytes):
+                    previous = previous.decode()
+                if previous:
+                    # Already stored: give the sender its echo again so the
+                    # message leaves "Sending" — nobody else is notified twice.
+                    await websocket.send_text(previous)
+                # Empty value = the first attempt is still being processed;
+                # its own echo will arrive. Either way: do not store again.
+                return
+        except Exception:  # noqa: BLE001 — Redis trouble must not block sending
+            logger.warning("send dedupe unavailable; processing without it", exc_info=True)
+            key = None
+
+    event: Optional[dict] = None
+    try:
+        event = await _persist_and_publish_message(
+            websocket, redis, conversation_id, conv_id_str, user_id, user_id_str, data, ctx,
+        )
+    finally:
+        if key is not None and claimed:
+            try:
+                if event is None:
+                    # Rejected or crashed: free the id so a corrected retry works.
+                    await redis.delete(key)
+                else:
+                    stored = {k: v for k, v in event.items() if not k.startswith("_")}
+                    await redis.set(key, json.dumps(stored), ex=SEND_DEDUPE_TTL_SECONDS)
+            except Exception:  # noqa: BLE001
+                logger.warning("send dedupe bookkeeping failed", exc_info=True)
+
+
+async def _persist_and_publish_message(
+    websocket: WebSocket,
+    redis: aioredis.Redis,
+    conversation_id: UUID,
+    conv_id_str: str,
+    user_id: UUID,
+    user_id_str: str,
+    data: dict,
+    ctx: ConnContext = ConnContext(),
+) -> Optional[dict]:
+    """
+    Persist + publish a new chat message. Returns the event sent back to the
+    sender, or None when the frame was rejected (an error frame was sent).
+    """
     # Optional client-supplied dedupe id; echoed in the published event so
     # the sender's optimistic UI can match it to the persisted message (and
     # in error frames, so it can mark exactly that message as failed).
@@ -210,6 +284,16 @@ async def _handle_message(
     if msg_type is None or msg_type is MessageType.system:
         await fail(f"Unknown message_type: {message_type_str!r}")
         return
+
+    # View-once: photos / videos in one-to-one chats only, and the server
+    # must know the blob so it can delete it the moment it is opened.
+    if self_destruct:
+        if ctx.is_group:
+            await fail("View-once media isn't available in groups", code="view_once_unsupported")
+            return None
+        if msg_type not in (MessageType.image, MessageType.video) or media_blob_id is None:
+            await fail("View-once is only for photos and videos", code="view_once_unsupported")
+            return None
 
     async with AsyncSessionLocal() as db:
         # Membership is re-checked on every send: a member removed from a
@@ -272,7 +356,7 @@ async def _handle_message(
             # message as sent and they are never told they were blocked —
             # telling them turns a safety tool into a provocation. The id is
             # a throwaway: nothing was persisted.
-            await websocket.send_text(json.dumps({
+            echo = {
                 "type": "message",
                 "conversation_id": conv_id_str,
                 "sender_id": user_id_str,
@@ -283,8 +367,9 @@ async def _handle_message(
                 "self_destruct": self_destruct,
                 "reply_to_id": str(reply_to_id) if reply_to_id else None,
                 "timestamp": datetime.now(timezone.utc).isoformat(),
-            }))
-            return
+            }
+            await websocket.send_text(json.dumps(echo))
+            return echo
 
         msg = MessageMetadata(
             conversation_id=conversation_id,
@@ -331,6 +416,7 @@ async def _handle_message(
     _spawn_background(
         _notify_new_message(redis, conversation_id, conv_id_str, user_id, msg.id, event)
     )
+    return event
 
 
 async def _notify_new_message(

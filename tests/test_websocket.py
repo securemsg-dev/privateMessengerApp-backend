@@ -609,3 +609,108 @@ async def test_is_user_connected_presence():
 
     await manager.disconnect_user(ws, uid)  # type: ignore[arg-type]
     assert manager.is_user_connected(uid) is False
+
+
+# ── Send idempotency (client_temp_id) ────────────────────────────────────────
+
+@pytest.mark.asyncio
+async def test_ws_retry_with_same_client_temp_id_is_stored_once(ws_client):
+    """A retry of a frame whose echo was lost must not create a second
+    message: the sender just gets the original echo again."""
+    user_a_id, conv_id = await _setup_user_and_conversation(
+        "+60300000090", extra_identifier="+60300000091",
+    )
+    user_b_id = await _user_id_by_identifier("+60300000091")
+    token_a = create_access_token(user_a_id)
+    token_b = create_access_token(user_b_id)
+    frame = json.dumps({
+        "type": "message",
+        "encrypted_payload": "cipher-once",
+        "message_type": "text",
+        "client_temp_id": "tmp-retry",
+    })
+
+    with ws_client.websocket_connect(f"/ws/{conv_id}?token={token_a}") as ws_a, \
+         ws_client.websocket_connect(f"/ws/{conv_id}?token={token_b}") as ws_b:
+        ws_a.send_text(frame)
+        first_b = json.loads(ws_b.receive_text())
+        first_a = json.loads(ws_a.receive_text())
+        assert first_a["message_id"] == first_b["message_id"]
+
+        # Retry: A gets the same echo again…
+        ws_a.send_text(frame)
+        again_a = json.loads(ws_a.receive_text())
+        assert again_a["type"] == "message"
+        assert again_a["message_id"] == first_a["message_id"]
+        assert again_a["client_temp_id"] == "tmp-retry"
+
+        # …and B gets nothing new: the next thing B sees is a different message.
+        ws_a.send_text(json.dumps({
+            "type": "message",
+            "encrypted_payload": "cipher-next",
+            "message_type": "text",
+            "client_temp_id": "tmp-next",
+        }))
+        next_b = json.loads(ws_b.receive_text())
+        assert next_b["encrypted_payload"] == "cipher-next"
+
+    async with TestSessionLocal() as session:
+        rows = (await session.execute(
+            select(MessageMetadata).where(MessageMetadata.conversation_id == conv_id)
+        )).scalars().all()
+        assert sorted(r.encrypted_payload for r in rows) == ["cipher-next", "cipher-once"]
+
+
+@pytest.mark.asyncio
+async def test_ws_rejected_frame_frees_its_client_temp_id(ws_client):
+    """A frame the server rejected is not remembered, so the corrected retry
+    under the same id goes through."""
+    user_a_id, conv_id = await _setup_user_and_conversation("+60300000092")
+    token_a = create_access_token(user_a_id)
+
+    with ws_client.websocket_connect(f"/ws/{conv_id}?token={token_a}") as ws_a:
+        ws_a.send_text(json.dumps({
+            "type": "message",
+            "encrypted_payload": "cipher",
+            "message_type": "not-a-type",
+            "client_temp_id": "tmp-fix",
+        }))
+        err = json.loads(ws_a.receive_text())
+        assert err["type"] == "error"
+        assert err["client_temp_id"] == "tmp-fix"
+
+        ws_a.send_text(json.dumps({
+            "type": "message",
+            "encrypted_payload": "cipher",
+            "message_type": "text",
+            "client_temp_id": "tmp-fix",
+        }))
+        echo = json.loads(ws_a.receive_text())
+        assert echo["type"] == "message"
+        assert echo["client_temp_id"] == "tmp-fix"
+
+
+@pytest.mark.asyncio
+async def test_ws_view_once_requires_photo_or_video_with_blob(ws_client):
+    """self_destruct (view-once) is only accepted for media the server can
+    delete later — a text frame with the flag is rejected, not stored."""
+    user_a_id, conv_id = await _setup_user_and_conversation("+60300000093")
+    token_a = create_access_token(user_a_id)
+
+    with ws_client.websocket_connect(f"/ws/{conv_id}?token={token_a}") as ws_a:
+        ws_a.send_text(json.dumps({
+            "type": "message",
+            "encrypted_payload": "cipher",
+            "message_type": "text",
+            "self_destruct": True,
+            "client_temp_id": "tmp-vo",
+        }))
+        err = json.loads(ws_a.receive_text())
+        assert err["type"] == "error"
+        assert err["code"] == "view_once_unsupported"
+
+    async with TestSessionLocal() as session:
+        rows = (await session.execute(
+            select(MessageMetadata).where(MessageMetadata.conversation_id == conv_id)
+        )).scalars().all()
+        assert rows == []

@@ -7,6 +7,8 @@ Per-message endpoints (Phase C.2 onwards):
   POST /messages/{id}/star    — star or unstar a message (caller-private)
   POST /messages/{id}/delete  — delete-for-me (hide) or delete-for-everyone
                                  (wipe payload + broadcast tombstone)
+  POST /messages/{id}/opened  — recipient opened a view-once photo/video:
+                                 wipe payload + blob, broadcast "opened"
 
 Reactions are intentionally NOT here — they fan out via WebSocket so peers
 see them in real time (see app/websocket/router.py).
@@ -26,7 +28,7 @@ from app.db.models.media_blob import MediaBlob
 from app.db.models.message import MessageMetadata, MessageType
 from app.db.models.starred_message import StarredMessage
 from app.schemas.messaging import DeleteMessageRequest, StarMessageRequest
-from app.services.media_storage import storage_for
+from app.services.media_storage import forget_download_url, storage_for
 from app.websocket.manager import manager
 
 # How long after sending a message you can still wipe it for everyone.
@@ -178,6 +180,8 @@ async def delete_message(
         if blob is not None:
             await storage_for(blob).delete_bytes(blob.id)
             await db.delete(blob)
+            # The bytes are gone — stop handing out the cached download URL.
+            await forget_download_url(request.app.state.redis, blob.id)
     await db.flush()
 
     # Broadcast tombstone to every connected client in this conversation.
@@ -190,4 +194,62 @@ async def delete_message(
         "timestamp": now.isoformat(),
     }
     await manager.publish(redis, str(msg.conversation_id), event)
+    return None
+
+
+@router.post(
+    "/{message_id}/opened",
+    status_code=status.HTTP_204_NO_CONTENT,
+    summary="Mark a view-once photo/video as opened (wipes it for everyone)",
+)
+@limiter.limit("60/minute")
+async def mark_view_once_opened(
+    request: Request,
+    message_id: UUID,
+    current_user: CurrentUser,
+    db: DBSession,
+) -> None:
+    """
+    Called by the RECIPIENT's app when it opens a view-once message. From that
+    moment the media is gone server-side: the ciphertext payload (which holds
+    the media key) is cleared and the blob is deleted, so it can't be fetched
+    again from any device. Both sides get a `view_once_opened` event and show
+    "Opened". Idempotent — a second call is a no-op.
+    """
+    msg = await _resolve_message_for_user(db, message_id, current_user.id)
+    if not msg.self_destruct:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail="Not a view-once message",
+        )
+    if msg.sender_id == current_user.id:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Only the recipient can open a view-once message",
+        )
+    if msg.opened_at is not None or msg.deleted_at is not None:
+        return None
+
+    now = datetime.now(timezone.utc)
+    msg.opened_at = now
+    msg.encrypted_payload = ""  # the media key lived in here
+    if msg.media_blob_id is not None:
+        blob = (await db.execute(
+            select(MediaBlob).where(MediaBlob.id == msg.media_blob_id)
+        )).scalar_one_or_none()
+        msg.media_blob_id = None
+        if blob is not None:
+            await storage_for(blob).delete_bytes(blob.id)
+            await db.delete(blob)
+            # The bytes are gone — stop handing out the cached download URL.
+            await forget_download_url(request.app.state.redis, blob.id)
+    await db.flush()
+
+    await manager.publish(request.app.state.redis, str(msg.conversation_id), {
+        "type": "view_once_opened",
+        "conversation_id": str(msg.conversation_id),
+        "message_id": str(msg.id),
+        "by_user_id": str(current_user.id),
+        "timestamp": now.isoformat(),
+    })
     return None

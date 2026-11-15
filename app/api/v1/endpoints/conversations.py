@@ -657,6 +657,7 @@ async def list_messages(
             delivered_at=m.delivered_at,
             read_at=m.read_at,
             self_destruct=m.self_destruct,
+            opened_at=m.opened_at,
             reactions=reactions_map.get(m.id, []),
             is_starred=m.id in starred_set,
             reply_to_id=m.reply_to_id,

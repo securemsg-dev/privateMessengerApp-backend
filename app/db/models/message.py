@@ -58,7 +58,12 @@ class MessageMetadata(UUIDPrimaryKeyMixin, TimestampMixin, Base):
     )
     self_destruct: Mapped[bool] = mapped_column(
         Boolean, default=False, nullable=False,
-        comment="Burn-on-read: client deletes from local DB after first open",
+        comment="View-once media: may be opened a single time by the recipient",
+    )
+    opened_at: Mapped[Optional[datetime]] = mapped_column(
+        DateTime(timezone=True), nullable=True,
+        comment="View-once media: when the recipient opened it. Payload and "
+                "blob are wiped at the same time.",
     )
     reply_to_id: Mapped[Optional[uuid.UUID]] = mapped_column(
         UUID(as_uuid=True),

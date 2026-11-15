@@ -264,6 +264,9 @@ class MessageResponse(BaseModel):
     delivered_at: Optional[datetime]
     read_at: Optional[datetime]
     self_destruct: bool
+    # View-once media only: set once the recipient has opened it (the payload
+    # is then empty and clients render "Opened").
+    opened_at: Optional[datetime] = None
     reactions: list[ReactionAggregate] = []
     is_starred: bool = False
     reply_to_id: Optional[UUID] = None

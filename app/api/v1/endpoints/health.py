@@ -16,7 +16,8 @@ from app.schemas.common import HealthResponse
 def enabled_features() -> list[str]:
     """Capability flags advertised to clients (see HealthResponse.features)."""
     # media_urls: POST /media/download-urls + /media/{id}/complete exist.
-    features = ["video", "presence", "media_urls", "groups"]
+    # view_once: self_destruct media + POST /messages/{id}/opened.
+    features = ["video", "presence", "media_urls", "groups", "view_once"]
     if settings.MEDIA_STORAGE_BACKEND == "s3":
         features.append("direct_upload")
     return features
