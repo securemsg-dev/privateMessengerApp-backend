@@ -662,6 +662,52 @@ async def test_ws_retry_with_same_client_temp_id_is_stored_once(ws_client):
 
 
 @pytest.mark.asyncio
+async def test_ws_publish_failure_after_commit_still_echoes_and_dedupes(ws_client):
+    """Redis publish failing after the INSERT must not (a) drop the sender's
+    socket with no reply, nor (b) free the client_temp_id — otherwise the
+    client's retry would store the message a second time."""
+    from app.websocket.manager import manager
+
+    user_a_id, conv_id = await _setup_user_and_conversation("+60300000094")
+    token_a = create_access_token(user_a_id)
+    frame = json.dumps({
+        "type": "message",
+        "encrypted_payload": "cipher-blip",
+        "message_type": "text",
+        "client_temp_id": "tmp-blip",
+    })
+
+    real_publish = manager.publish
+    failed = {"done": False}
+
+    async def flaky_publish(redis, conversation_id, message):
+        if message.get("type") == "message" and not failed["done"]:
+            failed["done"] = True
+            raise ConnectionError("redis blip")
+        return await real_publish(redis, conversation_id, message)
+
+    with patch.object(manager, "publish", side_effect=flaky_publish), \
+         ws_client.websocket_connect(f"/ws/{conv_id}?token={token_a}") as ws_a:
+        ws_a.send_text(frame)
+        echo = json.loads(ws_a.receive_text())
+        assert failed["done"] is True
+        assert echo["type"] == "message"
+        assert echo["client_temp_id"] == "tmp-blip"
+        assert "_skip_user_ids" not in echo
+
+        # Retry under the same id (socket is still open): same message back.
+        ws_a.send_text(frame)
+        again = json.loads(ws_a.receive_text())
+        assert again["message_id"] == echo["message_id"]
+
+    async with TestSessionLocal() as session:
+        rows = (await session.execute(
+            select(MessageMetadata).where(MessageMetadata.conversation_id == conv_id)
+        )).scalars().all()
+        assert [r.encrypted_payload for r in rows] == ["cipher-blip"]
+
+
+@pytest.mark.asyncio
 async def test_ws_rejected_frame_frees_its_client_temp_id(ws_client):
     """A frame the server rejected is not remembered, so the corrected retry
     under the same id goes through."""

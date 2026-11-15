@@ -42,7 +42,7 @@ import json
 import logging
 from dataclasses import dataclass
 from datetime import datetime, timezone
-from typing import Optional
+from typing import Awaitable, Callable, Optional
 from uuid import UUID, uuid4
 
 from fastapi import APIRouter, Query, WebSocket, WebSocketDisconnect, status
@@ -163,8 +163,13 @@ def _group_envelope_recipients(payload: str) -> Optional[set[str]]:
 # Redis key per (conversation, sender, client_temp_id):
 #   ""            → a send with this id is in flight right now
 #   "<event json>" → it was stored; re-echo this to the sender instead
+# The stored value is written straight after the DB commit, BEFORE the
+# publish, so a publish failure can never free an id whose message exists.
+# The in-flight marker is short-lived: if the worker dies mid-send, retries
+# are only swallowed until it expires, not for the full dedupe window.
 # Fail open: if Redis is unavailable the message is simply sent as before.
 SEND_DEDUPE_TTL_SECONDS = 600
+SEND_INFLIGHT_TTL_SECONDS = 30
 
 
 def _dedupe_key(conv_id_str: str, user_id_str: str, client_temp_id: str) -> str:
@@ -191,7 +196,7 @@ async def _handle_message(
     claimed = False
     if key is not None:
         try:
-            claimed = bool(await redis.set(key, "", nx=True, ex=SEND_DEDUPE_TTL_SECONDS))
+            claimed = bool(await redis.set(key, "", nx=True, ex=SEND_INFLIGHT_TTL_SECONDS))
             if not claimed:
                 previous = await redis.get(key)
                 if isinstance(previous, bytes):
@@ -207,20 +212,30 @@ async def _handle_message(
             logger.warning("send dedupe unavailable; processing without it", exc_info=True)
             key = None
 
-    event: Optional[dict] = None
+    stored = False
+
+    async def remember(echo: dict) -> None:
+        """Called once the message is committed (or blocked-echoed)."""
+        nonlocal stored
+        stored = True
+        if key is None or not claimed:
+            return
+        try:
+            await redis.set(key, json.dumps(echo), ex=SEND_DEDUPE_TTL_SECONDS)
+        except Exception:  # noqa: BLE001
+            logger.warning("send dedupe bookkeeping failed", exc_info=True)
+
     try:
-        event = await _persist_and_publish_message(
+        await _persist_and_publish_message(
             websocket, redis, conversation_id, conv_id_str, user_id, user_id_str, data, ctx,
+            on_stored=remember,
         )
     finally:
-        if key is not None and claimed:
+        if key is not None and claimed and not stored:
+            # Rejected, or failed before anything was written: free the id
+            # so a corrected retry goes through.
             try:
-                if event is None:
-                    # Rejected or crashed: free the id so a corrected retry works.
-                    await redis.delete(key)
-                else:
-                    stored = {k: v for k, v in event.items() if not k.startswith("_")}
-                    await redis.set(key, json.dumps(stored), ex=SEND_DEDUPE_TTL_SECONDS)
+                await redis.delete(key)
             except Exception:  # noqa: BLE001
                 logger.warning("send dedupe bookkeeping failed", exc_info=True)
 
@@ -234,10 +249,13 @@ async def _persist_and_publish_message(
     user_id_str: str,
     data: dict,
     ctx: ConnContext = ConnContext(),
+    on_stored: Optional[Callable[[dict], Awaitable[None]]] = None,
 ) -> Optional[dict]:
     """
     Persist + publish a new chat message. Returns the event sent back to the
     sender, or None when the frame was rejected (an error frame was sent).
+    `on_stored` receives the sender's echo as soon as the message is final
+    (committed, or echoed-only when every recipient blocked the sender).
     """
     # Optional client-supplied dedupe id; echoed in the published event so
     # the sender's optimistic UI can match it to the persisted message (and
@@ -368,6 +386,8 @@ async def _persist_and_publish_message(
                 "reply_to_id": str(reply_to_id) if reply_to_id else None,
                 "timestamp": datetime.now(timezone.utc).isoformat(),
             }
+            if on_stored is not None:
+                await on_stored(echo)
             await websocket.send_text(json.dumps(echo))
             return echo
 
@@ -401,12 +421,25 @@ async def _persist_and_publish_message(
     if ctx.is_group:
         event["sender_display_name"] = ctx.sender_name
         event["sender_public_key"] = ctx.sender_public_key
+    # The message exists now: record it for retries before anything else can
+    # fail (the echo stored is exactly what the sender would have received).
+    if on_stored is not None:
+        await on_stored(event)
     # Group case: some members blocked the sender but others didn't, so the
     # message is stored and delivered — just not to the blockers. The manager
     # strips this key before it reaches any socket.
+    published = dict(event)
     if blockers:
-        event["_skip_user_ids"] = [str(uid) for uid in blockers]
-    await manager.publish(redis, conv_id_str, event)
+        published["_skip_user_ids"] = [str(uid) for uid in blockers]
+    try:
+        await manager.publish(redis, conv_id_str, published)
+    except Exception:  # noqa: BLE001
+        # The message is committed, so this must not look like a failed send
+        # (the old behaviour dropped the socket with no reply). Echo to the
+        # sender directly; recipients still get the push / user-channel
+        # notification below, and the message is in their history.
+        logger.exception("publish failed after commit conv=%s msg=%s", conv_id_str, msg.id)
+        await websocket.send_text(json.dumps(event))
 
     # Notify the OTHER participants out-of-band: an in-app live update over
     # their always-on user channel if they're online elsewhere (so their chat
@@ -414,7 +447,7 @@ async def _persist_and_publish_message(
     # push if they're fully offline. Background task so it never adds latency
     # to the send path.
     _spawn_background(
-        _notify_new_message(redis, conversation_id, conv_id_str, user_id, msg.id, event)
+        _notify_new_message(redis, conversation_id, conv_id_str, user_id, msg.id, published)
     )
     return event
 
