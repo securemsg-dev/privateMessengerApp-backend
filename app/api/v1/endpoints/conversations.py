@@ -484,10 +484,18 @@ async def list_conversations(
         description="Include group chats. Sent by app builds that support "
                     "groups; older builds never see them.",
     ),
+    view_once: bool = Query(
+        False,
+        description="Sent by app builds that understand view-once media, so "
+                    "others may send this user view-once photos and videos.",
+    ),
 ) -> list[ConversationResponse]:
     if include_groups and not current_user.supports_groups:
         # This user now runs a groups-capable build, so they may be added.
         current_user.supports_groups = True
+        await db.flush()
+    if view_once and not current_user.supports_view_once:
+        current_user.supports_view_once = True
         await db.flush()
 
     q = (

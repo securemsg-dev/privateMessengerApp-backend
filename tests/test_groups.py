@@ -110,6 +110,15 @@ async def test_listing_with_groups_marks_user_group_capable(client, db_session):
     assert (await db_session.get(User, uid)).supports_groups is True
 
 
+async def test_listing_with_view_once_marks_user_view_once_capable(client, db_session):
+    reg, uid = await _ready_user(client, db_session, name="Eve")
+    # A build that predates view-once doesn't send the flag.
+    await client.get("/api/v1/conversations?include_groups=true", headers=_h(reg))
+    assert (await db_session.get(User, uid)).supports_view_once is False
+    await client.get("/api/v1/conversations?include_groups=true&view_once=true", headers=_h(reg))
+    assert (await db_session.get(User, uid)).supports_view_once is True
+
+
 @pytest.mark.parametrize(
     "setup, status",
     [

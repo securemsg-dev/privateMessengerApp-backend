@@ -77,6 +77,12 @@ class User(UUIDPrimaryKeyMixin, TimestampMixin, Base):
         comment="Set once an app build that understands groups lists chats. "
                 "Only such users can be added to a group.",
     )
+    # ── View-once ─────────────────────────────────────────────────────────
+    supports_view_once: Mapped[bool] = mapped_column(
+        Boolean, default=False, server_default=false(), nullable=False,
+        comment="Set once an app build that understands view-once lists chats. "
+                "Only such users can be sent view-once media.",
+    )
 
     # ── Relationships ─────────────────────────────────────────────────────
     devices: Mapped[list["Device"]] = relationship(  # noqa: F821

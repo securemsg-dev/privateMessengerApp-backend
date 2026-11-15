@@ -760,3 +760,63 @@ async def test_ws_view_once_requires_photo_or_video_with_blob(ws_client):
             select(MessageMetadata).where(MessageMetadata.conversation_id == conv_id)
         )).scalars().all()
         assert rows == []
+
+
+@pytest.mark.asyncio
+async def test_ws_view_once_needs_recipient_on_a_supporting_build(ws_client):
+    """A view-once photo to someone whose app predates view-once is refused
+    (their app would show it as an ordinary, re-openable photo). Once their
+    app reports support, the same send goes through."""
+    from datetime import datetime, timezone
+
+    from app.db.models.media_blob import MediaBlob
+
+    user_a_id, conv_id = await _setup_user_and_conversation("+60300000096", "+60300000097")
+    async with TestSessionLocal() as session:
+        blob = MediaBlob(
+            owner_id=user_a_id, size_bytes=3, mime="image/jpeg",
+            uploaded_at=datetime.now(timezone.utc),
+        )
+        session.add(blob)
+        await session.commit()
+        blob_id = blob.id
+        peer_id = (await session.execute(
+            select(conversation_participants.c.user_id).where(
+                conversation_participants.c.conversation_id == conv_id,
+                conversation_participants.c.user_id != user_a_id,
+            )
+        )).scalar_one()
+
+    def frame(temp_id: str) -> str:
+        return json.dumps({
+            "type": "message", "encrypted_payload": "cipher", "message_type": "image",
+            "self_destruct": True, "media_blob_id": str(blob_id), "client_temp_id": temp_id,
+        })
+
+    def reply(ws) -> dict:
+        for _ in range(5):  # skip e.g. a presence snapshot
+            event = json.loads(ws.receive_text())
+            if event["type"] in ("message", "error"):
+                return event
+        raise AssertionError("no reply to the send")
+
+    token_a = create_access_token(user_a_id)
+    with ws_client.websocket_connect(f"/ws/{conv_id}?token={token_a}") as ws_a:
+        ws_a.send_text(frame("tmp-old-app"))
+        err = reply(ws_a)
+        assert err["type"] == "error"
+        assert err["code"] == "view_once_recipient_outdated"
+        assert err["client_temp_id"] == "tmp-old-app"
+
+    async with TestSessionLocal() as session:
+        assert (await session.execute(
+            select(MessageMetadata).where(MessageMetadata.conversation_id == conv_id)
+        )).scalars().all() == []
+        (await session.get(User, peer_id)).supports_view_once = True
+        await session.commit()
+
+    with ws_client.websocket_connect(f"/ws/{conv_id}?token={token_a}") as ws_a:
+        ws_a.send_text(frame("tmp-new-app"))
+        echo = reply(ws_a)
+        assert echo["type"] == "message"
+        assert echo["self_destruct"] is True

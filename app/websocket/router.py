@@ -346,6 +346,24 @@ async def _persist_and_publish_message(
             await fail(problem[0], code=problem[1])
             return
 
+        # View-once only works if the recipient's app understands it: an
+        # older build would show the photo as an ordinary one, kept and
+        # re-openable forever. Refuse rather than silently downgrade.
+        if self_destruct:
+            outdated = (await db.execute(
+                select(User.id).where(
+                    User.id.in_(members - {user_id}),
+                    User.supports_view_once.is_(False),
+                ).limit(1)
+            )).first()
+            if outdated is not None:
+                await fail(
+                    "They need to update Cricchat to receive view-once photos "
+                    "and videos. Send it as a normal photo, or ask them to update.",
+                    code="view_once_recipient_outdated",
+                )
+                return
+
         # If replying, verify the target lives in THIS conversation — stops
         # clients from cross-stitching threads they shouldn't have access to.
         if reply_to_id is not None:
