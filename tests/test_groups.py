@@ -263,6 +263,37 @@ async def test_blocked_sender_hidden_in_group(client, db_session, trio):
     assert msg["sender_display_name"] == "Bob" and msg["sender_public_key"]
 
 
+async def test_chat_list_last_message_is_per_viewer(client, db_session, trio):
+    """The chat-list preview obeys the same visibility as history: a member
+    who blocked the newest sender sees the newest message they CAN see."""
+    (alice, alice_id), (bob, bob_id), (carol, carol_id) = trio
+    gid = (await _create_group(client, alice, [bob_id, carol_id])).json()["id"]
+    now = datetime.now(timezone.utc)
+    db_session.add(MessageMetadata(
+        conversation_id=UUID(gid), sender_id=alice_id, message_type=MessageType.text,
+        encrypted_payload="from alice", created_at=now + timedelta(seconds=1),
+    ))
+    db_session.add(MessageMetadata(
+        conversation_id=UUID(gid), sender_id=bob_id, message_type=MessageType.text,
+        encrypted_payload="from bob", created_at=now + timedelta(seconds=2),
+    ))
+    db_session.add(BlockedUser(blocker_id=carol_id, blocked_id=bob_id))
+    await db_session.flush()
+
+    async def previews(reg) -> dict:
+        resp = await client.get("/api/v1/conversations?include_groups=true", headers=_h(reg))
+        assert resp.status_code == 200, resp.text
+        return {
+            c["id"]: (c["last_message"] or {}).get("encrypted_payload") for c in resp.json()
+        }
+
+    alice_view, carol_view = await previews(alice), await previews(carol)
+    assert alice_view[gid] == "from bob"
+    assert carol_view[gid] == "from alice"
+    # Carol's 1:1 with Alice (same batch, no messages) has no preview.
+    assert [p for cid, p in carol_view.items() if cid != gid] == [None]
+
+
 async def test_system_messages_cannot_be_deleted_for_everyone(client, db_session, trio):
     (alice, _), (_, bob_id), _ = trio
     data = (await _create_group(client, alice, [bob_id])).json()

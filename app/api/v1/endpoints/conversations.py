@@ -26,6 +26,7 @@ from uuid import UUID
 from fastapi import APIRouter, HTTPException, Query, Request, status
 from sqlalchemy import and_, desc, func, or_, select
 from sqlalchemy.exc import IntegrityError
+from sqlalchemy.orm import aliased
 
 from app.core.dependencies import CurrentUser, DBSession
 from app.core.limiter import limiter
@@ -185,47 +186,50 @@ async def _last_messages_for(
 ) -> dict[UUID, MessageMetadata]:
     """
     One query for the newest message of EVERY conversation in the batch.
-    Uses a row_number() window (portable across Postgres and the SQLite test
-    DB) instead of one ORDER BY … LIMIT 1 query per conversation.
+
+    Per conversation, a correlated `ORDER BY created_at DESC LIMIT 1`
+    subquery picks the newest visible id. Postgres runs it as a backward walk
+    of ix_messages_metadata_conversation_created that stops at the first
+    match: ~1 index probe per chat, no matter how long the history is. (The
+    old row_number() window read and sorted EVERY message of every chat on
+    each chat-list load.) Same plan as a LATERAL join, but it also runs on
+    the SQLite test DB.
     """
     if not conversation_ids:
         return {}
-    rn = (
-        func.row_number()
-        .over(
-            partition_by=MessageMetadata.conversation_id,
-            order_by=MessageMetadata.created_at.desc(),
-        )
-        .label("rn")
-    )
     me = conversation_participants
-    sub = (
-        select(MessageMetadata.id.label("mid"), rn)
-        .join(Conversation, Conversation.id == MessageMetadata.conversation_id)
-        .join(me, and_(
-            me.c.conversation_id == MessageMetadata.conversation_id,
-            me.c.user_id == current_user_id,
-        ))
+    m = aliased(MessageMetadata)
+    newest_visible_id = (
+        select(m.id)
         .where(
-            MessageMetadata.conversation_id.in_(conversation_ids),
+            m.conversation_id == me.c.conversation_id,
             # Groups: only what this member may see — nothing from before
             # they joined (not encrypted for them) or from people they block.
             or_(
                 Conversation.is_group.is_(False),
                 and_(
-                    MessageMetadata.created_at >= me.c.joined_at,
-                    MessageMetadata.sender_id.not_in(_blocked_by(current_user_id)),
+                    m.created_at >= me.c.joined_at,
+                    m.sender_id.not_in(_blocked_by(current_user_id)),
                 ),
             ),
         )
-        .subquery()
+        .order_by(m.created_at.desc())
+        .limit(1)
+        .correlate(me, Conversation)
+        .scalar_subquery()
+    )
+    newest_ids = (
+        select(newest_visible_id)
+        .select_from(me.join(Conversation, Conversation.id == me.c.conversation_id))
+        .where(
+            me.c.user_id == current_user_id,
+            me.c.conversation_id.in_(conversation_ids),
+        )
     )
     rows = (await db.execute(
-        select(MessageMetadata)
-        .join(sub, MessageMetadata.id == sub.c.mid)
-        .where(sub.c.rn == 1)
+        select(MessageMetadata).where(MessageMetadata.id.in_(newest_ids))
     )).scalars().all()
-    return {m.conversation_id: m for m in rows}
+    return {msg.conversation_id: msg for msg in rows}
 
 
 async def _other_participants_for(
