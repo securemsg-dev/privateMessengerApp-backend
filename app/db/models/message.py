@@ -14,7 +14,7 @@ import enum
 import uuid
 from datetime import datetime
 
-from sqlalchemy import Boolean, DateTime, Enum, ForeignKey, Text
+from sqlalchemy import Boolean, DateTime, Enum, ForeignKey, Index, Text
 from sqlalchemy.dialects.postgresql import UUID
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
@@ -34,10 +34,17 @@ class MessageType(str, enum.Enum):
 
 class MessageMetadata(UUIDPrimaryKeyMixin, TimestampMixin, Base):
     __tablename__ = "messages_metadata"
+    __table_args__ = (
+        # Serves every "messages of conversation X [newest first]" lookup:
+        # history pages, the chat-list last-message probe, and the FK cascade
+        # on conversation delete. No separate conversation_id-only index —
+        # this one's leading column already covers it (migration b0c1d2e3f4a5).
+        Index("ix_messages_metadata_conversation_created", "conversation_id", "created_at"),
+    )
 
     conversation_id: Mapped[uuid.UUID] = mapped_column(
         UUID(as_uuid=True), ForeignKey("conversations.id", ondelete="CASCADE"),
-        nullable=False, index=True,
+        nullable=False,
     )
     sender_id: Mapped[uuid.UUID] = mapped_column(
         UUID(as_uuid=True), ForeignKey("users.id", ondelete="CASCADE"),
