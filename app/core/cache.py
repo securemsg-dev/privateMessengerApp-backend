@@ -75,15 +75,8 @@ async def cache_get(redis, key: str) -> Optional[Any]:
     if not settings.CACHE_ENABLED or redis is None:
         return None
     raw = await _guarded(redis.get(_full_key(key)), "get")
-    if raw is None:
-        _record(hit=False)
-        return None
-    try:
-        value = json.loads(raw)
-    except (ValueError, TypeError):
-        _record(hit=False)
-        return None
-    _record(hit=True)
+    value = _decode(raw)
+    _record(hit=value is not None)
     return value
 
 
@@ -97,6 +90,62 @@ async def cache_set(redis, key: str, value: Any, ttl: int) -> None:
         logger.warning("cache set skipped: value for %r is not JSON-serialisable", key)
         return
     await _guarded(redis.set(_full_key(key), raw, ex=max(1, int(ttl))), "set")
+
+
+def _decode(raw) -> Optional[Any]:
+    if raw is None:
+        return None
+    try:
+        return json.loads(raw)
+    except (ValueError, TypeError):
+        return None
+
+
+async def cache_get_many(redis, keys: list[str]) -> list[Optional[Any]]:
+    """
+    cache_get for many keys in ONE round trip (MGET). The result lines up
+    with `keys`; misses, malformed entries and any Redis failure are None.
+    """
+    if not keys:
+        return []
+    if not settings.CACHE_ENABLED or redis is None:
+        return [None] * len(keys)
+    try:
+        op = redis.mget([_full_key(k) for k in keys])
+    except Exception as exc:  # noqa: BLE001 — fail open
+        logger.warning("cache mget failed (%s); using database", type(exc).__name__)
+        return [None] * len(keys)
+    raws = await _guarded(op, "mget")
+    if not isinstance(raws, list) or len(raws) != len(keys):
+        raws = [None] * len(keys)  # failed (fail open) or unexpected shape
+    values = [_decode(raw) for raw in raws]
+    for value in values:
+        _record(hit=value is not None)
+    return values
+
+
+async def cache_set_many(redis, items: list[tuple[str, Any, int]]) -> None:
+    """cache_set for many (key, value, ttl) entries in ONE round trip (pipeline)."""
+    if not settings.CACHE_ENABLED or redis is None or not items:
+        return
+    try:
+        pipe = redis.pipeline(transaction=False)
+    except Exception as exc:  # noqa: BLE001 — fail open
+        logger.warning("cache set_many failed (%s); skipping", type(exc).__name__)
+        return
+    queued = 0
+    for key, value, ttl in items:
+        if value is None:
+            continue
+        try:
+            raw = json.dumps(value, separators=(",", ":"))
+        except (TypeError, ValueError):
+            logger.warning("cache set skipped: value for %r is not JSON-serialisable", key)
+            continue
+        pipe.set(_full_key(key), raw, ex=max(1, int(ttl)))
+        queued += 1
+    if queued:
+        await _guarded(pipe.execute(), "set_many")
 
 
 async def cache_delete(redis, *keys: str) -> None:

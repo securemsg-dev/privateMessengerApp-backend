@@ -179,3 +179,27 @@ async def test_hung_redis_times_out_instead_of_blocking(monkeypatch):
 async def test_corrupt_entry_is_a_miss(fake_redis):
     await fake_redis.set(cache.KEY_PREFIX + "t:8", b"{not json")
     assert await cache.cache_get(fake_redis, "t:8") is None
+
+
+# ── Batch helpers (MGET / pipeline) ───────────────────────────────────────────
+
+@pytest.mark.asyncio
+async def test_get_many_lines_up_hits_and_misses(fake_redis):
+    await cache.cache_set(fake_redis, "m:a", {"v": 1}, 60)
+    await fake_redis.set(cache.KEY_PREFIX + "m:c", b"{not json")
+    assert await cache.cache_get_many(fake_redis, ["m:a", "m:b", "m:c"]) == [{"v": 1}, None, None]
+    assert await cache.cache_get_many(fake_redis, []) == []
+
+
+@pytest.mark.asyncio
+async def test_set_many_writes_every_entry_with_its_ttl(fake_redis):
+    await cache.cache_set_many(fake_redis, [("m:x", [1], 60), ("m:y", "two", 120), ("m:z", None, 60)])
+    assert await cache.cache_get_many(fake_redis, ["m:x", "m:y", "m:z"]) == [[1], "two", None]
+    assert 60 < await fake_redis.ttl(cache.KEY_PREFIX + "m:y") <= 120
+
+
+@pytest.mark.asyncio
+async def test_batch_helpers_fail_open():
+    # No mget / pipeline at all, like a broken client: misses, never errors.
+    assert await cache.cache_get_many(_BrokenRedis(), ["a", "b"]) == [None, None]
+    await cache.cache_set_many(_BrokenRedis(), [("a", 1, 60)])

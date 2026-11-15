@@ -123,3 +123,38 @@ async def test_deleting_the_message_drops_the_cached_url(client, db_session):
         assert await _urls(client, bob["tokens"]["access_token"], blob_id) == {}
 
     assert bucket.signed == 1
+
+
+async def test_url_batch_uses_one_redis_round_trip_each_way(client, db_session, fake_redis):
+    """A page of media = one MGET to read and one pipeline to fill, not a
+    GET/SET per blob."""
+    alice = await register_and_login(client)
+    owner = UUID(alice["user"]["id"])
+    blob_ids = [str((await _blob(db_session, owner)).id) for _ in range(5)]
+    bucket = FakeBucket()
+
+    per_key_gets: list = []
+    real_get = fake_redis.get
+
+    async def counting_get(key, *a, **k):
+        if b"media:url:" in (key if isinstance(key, bytes) else key.encode()):
+            per_key_gets.append(key)
+        return await real_get(key, *a, **k)
+
+    async def post():
+        resp = await client.post(
+            "/api/v1/media/download-urls",
+            json={"blob_ids": blob_ids},
+            headers=auth_header(alice["tokens"]["access_token"]),
+        )
+        assert resp.status_code == 200, resp.text
+        return resp.json()["urls"]
+
+    with patch("app.api.v1.endpoints.media.storage_for", return_value=bucket), \
+         patch.object(fake_redis, "get", side_effect=counting_get):
+        first = await post()
+        second = await post()
+
+    assert bucket.signed == 5  # all signed once, then all served from cache
+    assert first == second and set(second) == set(blob_ids)
+    assert per_key_gets == []

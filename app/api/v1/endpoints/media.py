@@ -36,7 +36,7 @@ from app.schemas.messaging import (
     MediaUploadRequest,
     MediaUploadResponse,
 )
-from app.core.cache import cache_get, cache_set
+from app.core.cache import cache_get_many, cache_set_many
 from app.services.media_storage import (
     DOWNLOAD_URL_CACHE_MARGIN_SECONDS,
     OCTET_STREAM,
@@ -194,11 +194,12 @@ async def download_urls(
 
     # Presigned bucket URLs are reused from Redis while they are still fresh
     # (see media_storage: download-URL cache); only the rest touch Postgres.
+    # One MGET for the whole page instead of one GET per blob (up to 200).
     urls: dict[str, MediaDownloadUrl] = {}
     now = datetime.now(timezone.utc)
     missing: list[UUID] = []
-    for blob_id in ids:
-        hit = await cache_get(redis, download_url_cache_key(blob_id))
+    hits = await cache_get_many(redis, [download_url_cache_key(b) for b in ids])
+    for blob_id, hit in zip(ids, hits):
         try:
             expires_at = datetime.fromisoformat(hit["expires_at"]) if hit else None
             if expires_at and expires_at - now > timedelta(seconds=DOWNLOAD_URL_CACHE_MARGIN_SECONDS):
@@ -214,6 +215,7 @@ async def download_urls(
         select(MediaBlob).where(MediaBlob.id.in_(missing), MediaBlob.uploaded_at.is_not(None))
     )).scalars().all()
 
+    to_cache: list[tuple[str, dict, int]] = []
     for blob in blobs:
         storage = storage_for(blob)
         if storage.supports_direct:
@@ -221,14 +223,16 @@ async def download_urls(
             urls[str(blob.id)] = MediaDownloadUrl(url=url, auth=False, expires_at=expires_at)
             ttl = int((expires_at - now).total_seconds()) - DOWNLOAD_URL_CACHE_MARGIN_SECONDS
             if ttl > 0:
-                await cache_set(
-                    redis, download_url_cache_key(blob.id),
-                    {"url": url, "expires_at": expires_at.isoformat()}, ttl=ttl,
-                )
+                to_cache.append((
+                    download_url_cache_key(blob.id),
+                    {"url": url, "expires_at": expires_at.isoformat()},
+                    ttl,
+                ))
         else:
             urls[str(blob.id)] = MediaDownloadUrl(
                 url=_absolute_url(request, api_media_path(blob.id)), auth=True,
             )
+    await cache_set_many(redis, to_cache)  # one pipelined round trip
     return MediaDownloadUrlsResponse(urls=urls)
 
 
